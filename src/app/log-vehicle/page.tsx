@@ -1,11 +1,13 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useMemo } from "react";
 import { useRouter } from "next/navigation";
 import { useAuth } from "@/context/AuthContext";
 import { db } from "@/lib/firebase";
 import { collection, query, where, onSnapshot } from "firebase/firestore";
 import Sidebar from "@/components/Sidebar";
+import GradeBadge from "@/components/GradeBadge";
+import Link from "next/link";
 
 interface Guardian {
   id: string;
@@ -13,6 +15,12 @@ interface Guardian {
   email?: string;
   licensePlateNumbers?: string[];
   carDescriptions?: string[];
+  wardIds?: string[];
+}
+
+interface Student {
+  name: string;
+  grade: number;
 }
 
 interface VehicleEntry {
@@ -21,25 +29,27 @@ interface VehicleEntry {
   guardianEmail?: string;
   licensePlate: string;
   carDescription: string;
+  linkedStudents: Student[];
 }
 
 export default function LogVehiclePage() {
-  const { user, loading } = useAuth();
+  const { user, isAdmin, loading } = useAuth();
   const router = useRouter();
   const [guardians, setGuardians] = useState<Guardian[]>([]);
+  const [students, setStudents] = useState<Map<string, Student>>(new Map());
   const [vehicles, setVehicles] = useState<VehicleEntry[]>([]);
   const [searchQuery, setSearchQuery] = useState("");
   const [filteredVehicles, setFilteredVehicles] = useState<VehicleEntry[]>([]);
 
   useEffect(() => {
-    if (!loading && !user) {
+    if (!loading && (!user || !isAdmin)) {
       router.push("/login");
     }
-  }, [user, loading, router]);
+  }, [user, isAdmin, loading, router]);
 
   // Fetch guardians from Firestore
   useEffect(() => {
-    if (!user) return;
+    if (!user || !db) return;
 
     const usersRef = collection(db, "users");
     const q = query(usersRef, where("account_type", "==", "guardian"));
@@ -54,6 +64,7 @@ export default function LogVehiclePage() {
           email: data.email,
           licensePlateNumbers: data.licensePlateNumbers || [],
           carDescriptions: data.carDescriptions || [],
+          wardIds: data.wardIds || [],
         });
       });
       setGuardians(guardiansData);
@@ -62,13 +73,35 @@ export default function LogVehiclePage() {
     return () => unsubscribe();
   }, [user]);
 
-  // Build vehicle entries from guardians
+  // Fetch students from Firestore
+  useEffect(() => {
+    if (!user || !db) return;
+
+    const usersRef = collection(db, "users");
+    const q = query(usersRef, where("account_type", "==", "student"));
+
+    const unsubscribe = onSnapshot(q, (snapshot) => {
+      const map = new Map<string, Student>();
+      snapshot.forEach((doc) => {
+        const data = doc.data();
+        map.set(doc.id, { name: data.name || "Unknown", grade: data.grade || 0 });
+      });
+      setStudents(map);
+    });
+
+    return () => unsubscribe();
+  }, [user]);
+
+  // Build vehicle entries from guardians + resolved students
   useEffect(() => {
     const vehicleEntries: VehicleEntry[] = [];
 
     guardians.forEach((guardian) => {
       const plates = guardian.licensePlateNumbers || [];
       const descriptions = guardian.carDescriptions || [];
+      const linkedStudents = (guardian.wardIds || []).map(
+        (id) => students.get(id) ?? { name: `[${id}]`, grade: 0 }
+      );
 
       plates.forEach((plate, index) => {
         vehicleEntries.push({
@@ -77,14 +110,14 @@ export default function LogVehiclePage() {
           guardianEmail: guardian.email,
           licensePlate: plate,
           carDescription: descriptions[index] || "",
+          linkedStudents,
         });
       });
     });
 
-    // Sort by license plate
     vehicleEntries.sort((a, b) => a.licensePlate.localeCompare(b.licensePlate));
     setVehicles(vehicleEntries);
-  }, [guardians]);
+  }, [guardians, students]);
 
   // Filter vehicles by search query
   useEffect(() => {
@@ -93,15 +126,21 @@ export default function LogVehiclePage() {
       return;
     }
 
-    const query = searchQuery.toLowerCase();
+    const q = searchQuery.toLowerCase();
     const filtered = vehicles.filter(
       (v) =>
-        v.licensePlate.toLowerCase().includes(query) ||
-        v.guardianName.toLowerCase().includes(query) ||
-        v.carDescription.toLowerCase().includes(query)
+        v.licensePlate.toLowerCase().includes(q) ||
+        v.guardianName.toLowerCase().includes(q) ||
+        v.carDescription.toLowerCase().includes(q)
     );
     setFilteredVehicles(filtered);
   }, [vehicles, searchQuery]);
+
+  // Guardians with no vehicles registered
+  const guardiansWithNoVehicles = useMemo(
+    () => guardians.filter((g) => !g.licensePlateNumbers || g.licensePlateNumbers.length === 0),
+    [guardians]
+  );
 
   if (loading) {
     return (
@@ -174,6 +213,12 @@ export default function LogVehiclePage() {
                   <th className="px-6 py-3 text-left text-sm font-semibold text-gray-700">
                     Car Description
                   </th>
+                  <th className="px-6 py-3 text-left text-sm font-semibold text-gray-700">
+                    Linked Students
+                  </th>
+                  <th className="px-6 py-3 text-left text-sm font-semibold text-gray-700">
+                    Actions
+                  </th>
                 </tr>
               </thead>
               <tbody>
@@ -197,6 +242,28 @@ export default function LogVehiclePage() {
                       {vehicle.carDescription || (
                         <span className="text-gray-400 italic">No description</span>
                       )}
+                    </td>
+                    <td className="px-6 py-4">
+                      <div className="flex flex-wrap gap-2">
+                        {vehicle.linkedStudents.length > 0 ? (
+                          vehicle.linkedStudents.map((s, i) => (
+                            <span key={i} className="flex items-center gap-1">
+                              <span className="text-sm text-gray-700">{s.name}</span>
+                              <GradeBadge grade={s.grade} />
+                            </span>
+                          ))
+                        ) : (
+                          <span className="text-gray-400 text-sm italic">None linked</span>
+                        )}
+                      </div>
+                    </td>
+                    <td className="px-6 py-4">
+                      <Link
+                        href={`/admin/users?guardian=${vehicle.guardianId}`}
+                        className="text-blue-600 hover:underline text-sm font-medium"
+                      >
+                        View guardian
+                      </Link>
                     </td>
                   </tr>
                 ))}
@@ -250,6 +317,29 @@ export default function LogVehiclePage() {
             </div>
           )}
         </div>
+
+        {/* Guardians with no vehicles */}
+        {guardiansWithNoVehicles.length > 0 && (
+          <div className="mt-6 bg-yellow-50 border border-yellow-200 rounded-lg p-4">
+            <h3 className="font-semibold text-yellow-800 mb-2">
+              {guardiansWithNoVehicles.length} guardian{guardiansWithNoVehicles.length !== 1 ? "s" : ""} with no vehicles registered
+            </h3>
+            <ul className="space-y-1">
+              {guardiansWithNoVehicles.map((g) => (
+                <li key={g.id} className="text-sm text-yellow-700 flex items-center gap-2">
+                  <span>{g.name}</span>
+                  {g.email && <span className="text-yellow-500">({g.email})</span>}
+                  <Link
+                    href={`/admin/users?guardian=${g.id}`}
+                    className="text-yellow-800 underline text-xs ml-1"
+                  >
+                    View
+                  </Link>
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
       </div>
     </div>
   );

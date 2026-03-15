@@ -11,6 +11,7 @@ export default function Sidebar() {
   const [sidebarOpen, setSidebarOpen] = useState(true);
 
   const handleLogout = async () => {
+    if (!auth) return;
     await signOut(auth);
     router.push("/login");
   };
@@ -43,6 +44,15 @@ export default function Sidebar() {
       icon: (
         <svg className="w-5 h-5 flex-shrink-0" fill="currentColor" viewBox="0 0 20 20">
           <path d="M8 4a4 4 0 100 8 4 4 0 000-8zM2 8a6 6 0 1110.89 3.476l4.817 4.817a1 1 0 01-1.414 1.414l-4.816-4.816A6 6 0 012 8z" />
+        </svg>
+      ),
+    },
+    {
+      href: "/admin/users",
+      label: "User Management",
+      icon: (
+        <svg className="w-5 h-5 flex-shrink-0" fill="currentColor" viewBox="0 0 20 20">
+          <path d="M9 6a3 3 0 11-6 0 3 3 0 016 0zM17 6a3 3 0 11-6 0 3 3 0 016 0zM12.93 17c.046-.327.07-.66.07-1a6.97 6.97 0 00-1.5-4.33A5 5 0 0119 16v1h-6.07zM6 11a5 5 0 015 5v1H1v-1a5 5 0 015-5z" />
         </svg>
       ),
     },

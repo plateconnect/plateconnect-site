@@ -1,10 +1,16 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useMemo } from "react";
 import { useRouter } from "next/navigation";
 import { useAuth } from "@/context/AuthContext";
 import { db } from "@/lib/firebase";
-import { collection, query, orderBy, onSnapshot, Timestamp } from "firebase/firestore";
+import {
+  collection,
+  query,
+  orderBy,
+  onSnapshot,
+  Timestamp,
+} from "firebase/firestore";
 import Sidebar from "@/components/Sidebar";
 import GradeBadge from "@/components/GradeBadge";
 
@@ -23,36 +29,77 @@ interface Notice {
   left_school?: boolean;
 }
 
+function exportToCsv(rows: Notice[]) {
+  const headers = [
+    "Student",
+    "Grade",
+    "License Plate",
+    "Car Description",
+    "Location",
+    "Status",
+    "Date",
+    "Time",
+  ];
+  const lines = rows.map((n) => {
+    const d = n.arrival_time.toDate();
+    return [
+      n.ward_name,
+      n.student_grade,
+      n.license_plate ?? "",
+      n.car_description ?? "",
+      n.entrance_location ?? "",
+      n.left_school ? "Left" : "Pending",
+      d.toLocaleDateString(),
+      d.toLocaleTimeString(),
+    ]
+      .map((v) => `"${String(v).replace(/"/g, '""')}"`)
+      .join(",");
+  });
+  const csv = [headers.join(","), ...lines].join("\n");
+  const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `notices-${new Date().toISOString().split("T")[0]}.csv`;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
 export default function AdminDashboardPage() {
-  const { user, loading } = useAuth();
+  const { user, isAdmin, loading } = useAuth();
   const router = useRouter();
   const [notices, setNotices] = useState<Notice[]>([]);
-  const [filteredNotices, setFilteredNotices] = useState<Notice[]>([]);
+  const [lastSyncTime, setLastSyncTime] = useState<Date | null>(null);
+  const [now, setNow] = useState(() => new Date());
+  const [filtersOpen, setFiltersOpen] = useState(false);
+
+  // Pagination
+  const PAGE_SIZE = 50;
+  const [currentPage, setCurrentPage] = useState(1);
 
   // Filters
   const [startDate, setStartDate] = useState("");
   const [endDate, setEndDate] = useState("");
   const [startTime, setStartTime] = useState("");
   const [endTime, setEndTime] = useState("");
-  const [maxNotices, setMaxNotices] = useState(50);
-  const [selectedPersonTypes, setSelectedPersonTypes] = useState<string[]>([]);
-  const [selectedEnterExit, setSelectedEnterExit] = useState<string[]>([]);
-  const [entranceLocations, setEntranceLocations] = useState<string[]>(["Main Gate", "Side Entrance"]);
-  const [selectedEntranceLocations, setSelectedEntranceLocations] = useState<string[]>([]);
-  const [editingLocationIndex, setEditingLocationIndex] = useState<number | null>(null);
-  const [editingLocationValue, setEditingLocationValue] = useState("");
   const [selectedGradeLevels, setSelectedGradeLevels] = useState<string[]>([]);
   const [showLeftSchool, setShowLeftSchool] = useState<string>("all");
+  const [searchQuery, setSearchQuery] = useState("");
+  const [selectedLocations, setSelectedLocations] = useState<string[]>([]);
 
   useEffect(() => {
-    if (!loading && !user) {
+    if (!loading && (!user || !isAdmin)) {
       router.push("/login");
     }
-  }, [user, loading, router]);
+  }, [user, isAdmin, loading, router]);
 
-  // Fetch notices from Firestore
   useEffect(() => {
-    if (!user) return;
+    const id = setInterval(() => setNow(new Date()), 30_000);
+    return () => clearInterval(id);
+  }, []);
+
+  useEffect(() => {
+    if (!user || !db) return;
 
     const noticesRef = collection(db, "notices");
     const q = query(noticesRef, orderBy("arrival_time", "desc"));
@@ -67,122 +114,193 @@ export default function AdminDashboardPage() {
           ward_name: data.ward_name || "Unknown",
           student_grade: data.student_grade || 0,
           owner_id: data.owner_id,
-          license_plate: data.license_plate,
+          license_plate: data.licensePlate ?? data.license_plate,
           car_description: data.car_description,
           ward_id: data.ward_id,
           person_type: data.person_type || "unknown",
           action_type: data.action_type || "entry",
-          entrance_location: data.entrance_location,
+          entrance_location: data.entrance_location ?? data.location,
           left_school: data.left_school || false,
         });
       });
       setNotices(noticesData);
+      setLastSyncTime(new Date());
     });
 
     return () => unsubscribe();
   }, [user]);
 
-  // Filter notices
-  useEffect(() => {
+  // Stats
+  const stats = useMemo(() => {
+    const todayStart = new Date();
+    todayStart.setHours(0, 0, 0, 0);
+    const todayMs = todayStart.getTime();
+    const today = notices.filter((n) => n.arrival_time.toMillis() >= todayMs);
+
+    const weekStart = new Date();
+    weekStart.setDate(weekStart.getDate() - weekStart.getDay());
+    weekStart.setHours(0, 0, 0, 0);
+    const weekMs = weekStart.getTime();
+    const thisWeek = notices.filter(
+      (n) => n.arrival_time.toMillis() >= weekMs,
+    );
+
+    return {
+      todayTotal: today.length,
+      todayPending: today.filter((n) => !n.left_school).length,
+      todayLeft: today.filter((n) => n.left_school).length,
+      weekTotal: thisWeek.length,
+      allTime: notices.length,
+    };
+  }, [notices]);
+
+  const availableLocations = useMemo(() => {
+    const locs = new Set<string>();
+    notices.forEach((n) => {
+      if (n.entrance_location) locs.add(n.entrance_location);
+    });
+    return Array.from(locs).sort();
+  }, [notices]);
+
+  const syncLabel = useMemo(() => {
+    if (!lastSyncTime) return null;
+    const diffSec = Math.floor(
+      (now.getTime() - lastSyncTime.getTime()) / 1000,
+    );
+    if (diffSec < 5) return "Live";
+    if (diffSec < 60) return `${diffSec}s ago`;
+    return `${Math.floor(diffSec / 60)}m ago`;
+  }, [lastSyncTime, now]);
+
+  const filteredNotices = useMemo(() => {
     let filtered = notices;
 
-    // Filter by date
+    if (searchQuery.trim()) {
+      const q = searchQuery.toLowerCase();
+      filtered = filtered.filter(
+        (n) =>
+          n.ward_name.toLowerCase().includes(q) ||
+          (n.license_plate && n.license_plate.toLowerCase().includes(q)) ||
+          (n.car_description && n.car_description.toLowerCase().includes(q)),
+      );
+    }
+
     if (startDate || endDate) {
       filtered = filtered.filter((notice) => {
-        const noticeDate = notice.arrival_time.toDate();
-        const noticeDateStr = noticeDate.toISOString().split("T")[0];
-
+        const noticeDateStr = notice.arrival_time
+          .toDate()
+          .toISOString()
+          .split("T")[0];
         if (startDate && noticeDateStr < startDate) return false;
         if (endDate && noticeDateStr > endDate) return false;
         return true;
       });
     }
 
-    // Filter by time
     if (startTime || endTime) {
       filtered = filtered.filter((notice) => {
-        const noticeDate = notice.arrival_time.toDate();
-        const hours = noticeDate.getHours().toString().padStart(2, "0");
-        const minutes = noticeDate.getMinutes().toString().padStart(2, "0");
-        const noticeTimeStr = `${hours}:${minutes}`;
-
-        if (startTime && noticeTimeStr < startTime) return false;
-        if (endTime && noticeTimeStr > endTime) return false;
+        const d = notice.arrival_time.toDate();
+        const t = `${d.getHours().toString().padStart(2, "0")}:${d.getMinutes().toString().padStart(2, "0")}`;
+        if (startTime && t < startTime) return false;
+        if (endTime && t > endTime) return false;
         return true;
       });
     }
 
-    // Filter by person type
-    if (selectedPersonTypes.length > 0) {
-      filtered = filtered.filter((notice) => {
-        return selectedPersonTypes.includes(notice.person_type || "unknown");
-      });
-    }
-
-    // Filter by entrance location
-    if (selectedEntranceLocations.length > 0) {
-      filtered = filtered.filter((notice) => {
-        return selectedEntranceLocations.includes(notice.entrance_location || "");
-      });
-    }
-
-    // Filter by enter/exit
-    if (selectedEnterExit.length > 0) {
-      filtered = filtered.filter((notice) => {
-        return selectedEnterExit.includes(notice.action_type || "entry");
-      });
-    }
-
-    // Filter by grade level
     if (selectedGradeLevels.length > 0) {
       filtered = filtered.filter((notice) => {
         const grade = notice.student_grade;
-        if (selectedGradeLevels.includes("elementary") && grade >= 1 && grade <= 5) return true;
-        if (selectedGradeLevels.includes("middle") && grade >= 6 && grade <= 8) return true;
-        if (selectedGradeLevels.includes("high") && grade >= 9 && grade <= 12) return true;
+        if (
+          selectedGradeLevels.includes("elementary") &&
+          grade >= 1 &&
+          grade <= 5
+        )
+          return true;
+        if (
+          selectedGradeLevels.includes("middle") &&
+          grade >= 6 &&
+          grade <= 8
+        )
+          return true;
+        if (selectedGradeLevels.includes("high") && grade >= 9 && grade <= 12)
+          return true;
         return false;
       });
     }
 
-    // Filter by left school status
-    if (showLeftSchool === "left") {
-      filtered = filtered.filter((notice) => notice.left_school);
-    } else if (showLeftSchool === "pending") {
-      filtered = filtered.filter((notice) => !notice.left_school);
+    if (selectedLocations.length > 0) {
+      filtered = filtered.filter((n) =>
+        selectedLocations.includes(n.entrance_location || ""),
+      );
     }
 
-    setFilteredNotices(filtered.slice(0, maxNotices));
+    if (showLeftSchool === "left") {
+      filtered = filtered.filter((n) => n.left_school);
+    } else if (showLeftSchool === "pending") {
+      filtered = filtered.filter((n) => !n.left_school);
+    }
+
+    return filtered;
   }, [
     notices,
+    searchQuery,
     startDate,
     endDate,
     startTime,
     endTime,
-    maxNotices,
-    selectedPersonTypes,
-    selectedEnterExit,
-    selectedEntranceLocations,
     selectedGradeLevels,
+    selectedLocations,
     showLeftSchool,
   ]);
+
+  const totalPages = Math.max(
+    1,
+    Math.ceil(filteredNotices.length / PAGE_SIZE),
+  );
+  const pagedNotices = filteredNotices.slice(
+    (currentPage - 1) * PAGE_SIZE,
+    currentPage * PAGE_SIZE,
+  );
+
+  useEffect(() => {
+    setCurrentPage(1);
+  }, [
+    searchQuery,
+    startDate,
+    endDate,
+    startTime,
+    endTime,
+    selectedGradeLevels,
+    selectedLocations,
+    showLeftSchool,
+  ]);
+
+  const activeFilterCount = [
+    startDate || endDate,
+    startTime || endTime,
+    selectedGradeLevels.length > 0,
+    selectedLocations.length > 0,
+    showLeftSchool !== "all",
+  ].filter(Boolean).length;
 
   const resetFilters = () => {
     setStartDate("");
     setEndDate("");
     setStartTime("");
     setEndTime("");
-    setMaxNotices(50);
-    setSelectedPersonTypes([]);
-    setSelectedEntranceLocations([]);
-    setSelectedEnterExit([]);
     setSelectedGradeLevels([]);
+    setSelectedLocations([]);
     setShowLeftSchool("all");
+    setSearchQuery("");
   };
 
   if (loading) {
     return (
-      <div className="min-h-screen flex items-center justify-center">
-        <div className="text-xl text-gray-600">Loading...</div>
+      <div className="min-h-screen flex items-center justify-center bg-gray-50">
+        <div className="flex items-center gap-3">
+          <div className="w-5 h-5 border-2 border-blue-600 border-t-transparent rounded-full animate-spin" />
+          <span className="text-gray-500">Loading...</span>
+        </div>
       </div>
     );
   }
@@ -191,333 +309,600 @@ export default function AdminDashboardPage() {
     <div className="min-h-screen bg-gray-50 flex">
       <Sidebar />
 
-      {/* Main Content */}
-      <div className="flex-1 p-8">
-        <div className="flex justify-between items-center mb-8">
-          <div>
-            <h1 className="text-4xl font-bold text-gray-900">Admin Dashboard</h1>
-            <p className="text-gray-600 mt-1">Filter and analyze all pickup notices</p>
+      <div className="flex-1 overflow-auto">
+        {/* Header */}
+        <div className="sticky top-0 z-10 bg-white border-b border-gray-200">
+          <div className="px-8 py-5 flex items-center justify-between">
+            <div>
+              <h1 className="text-2xl font-bold text-gray-900">
+                Admin Dashboard
+              </h1>
+              <p className="text-sm text-gray-500 mt-0.5">
+                Arrival history and analytics
+              </p>
+            </div>
+            {syncLabel && (
+              <div className="flex items-center gap-2 text-xs text-gray-400 bg-gray-50 px-3 py-1.5 rounded-full">
+                <span
+                  className={`w-1.5 h-1.5 rounded-full ${syncLabel === "Live" ? "bg-green-500 animate-pulse" : "bg-gray-400"}`}
+                />
+                {syncLabel}
+              </div>
+            )}
           </div>
         </div>
 
-        {/* Filters */}
-        <div className="bg-white rounded-lg shadow p-6 mb-8">
-          <h2 className="text-lg font-bold text-gray-900 mb-4">Filters</h2>
-
-          {/* First Row */}
-          <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-4">
-            <div>
-              <label className="block text-sm font-medium text-gray-700 mb-2">Date Range</label>
-              <div className="flex gap-2">
-                <input
-                  type="date"
-                  value={startDate}
-                  onChange={(e) => setStartDate(e.target.value)}
-                  className="flex-1 px-3 py-1 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
-                />
-                <input
-                  type="date"
-                  value={endDate}
-                  onChange={(e) => setEndDate(e.target.value)}
-                  className="flex-1 px-3 py-1 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
-                />
+        <div className="px-8 py-6 space-y-6">
+          {/* Stats Row */}
+          <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+            <div className="bg-white rounded-xl border border-gray-200 p-5">
+              <div className="flex items-center justify-between mb-3">
+                <span className="text-xs font-medium text-gray-400 uppercase tracking-wider">
+                  Today
+                </span>
+                <span className="w-8 h-8 rounded-lg bg-blue-50 flex items-center justify-center">
+                  <svg
+                    className="w-4 h-4 text-blue-600"
+                    fill="none"
+                    stroke="currentColor"
+                    viewBox="0 0 24 24"
+                    strokeWidth={2}
+                  >
+                    <path
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"
+                    />
+                  </svg>
+                </span>
+              </div>
+              <div className="text-3xl font-bold text-gray-900">
+                {stats.todayTotal}
+              </div>
+              <div className="flex items-center gap-3 mt-2">
+                <span className="text-xs text-yellow-600 bg-yellow-50 px-2 py-0.5 rounded-full">
+                  {stats.todayPending} pending
+                </span>
+                <span className="text-xs text-green-600 bg-green-50 px-2 py-0.5 rounded-full">
+                  {stats.todayLeft} left
+                </span>
               </div>
             </div>
 
-            <div>
-              <label className="block text-sm font-medium text-gray-700 mb-2">Time Range</label>
-              <div className="flex gap-2">
-                <input
-                  type="time"
-                  value={startTime}
-                  onChange={(e) => setStartTime(e.target.value)}
-                  className="flex-1 px-3 py-1 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
-                />
-                <input
-                  type="time"
-                  value={endTime}
-                  onChange={(e) => setEndTime(e.target.value)}
-                  className="flex-1 px-3 py-1 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
-                />
+            <div className="bg-white rounded-xl border border-gray-200 p-5">
+              <div className="flex items-center justify-between mb-3">
+                <span className="text-xs font-medium text-gray-400 uppercase tracking-wider">
+                  This Week
+                </span>
+                <span className="w-8 h-8 rounded-lg bg-indigo-50 flex items-center justify-center">
+                  <svg
+                    className="w-4 h-4 text-indigo-600"
+                    fill="none"
+                    stroke="currentColor"
+                    viewBox="0 0 24 24"
+                    strokeWidth={2}
+                  >
+                    <path
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"
+                    />
+                  </svg>
+                </span>
               </div>
+              <div className="text-3xl font-bold text-gray-900">
+                {stats.weekTotal}
+              </div>
+              <div className="text-xs text-gray-400 mt-2">arrivals</div>
             </div>
 
-            <div>
-              <label className="block text-sm font-medium text-gray-700 mb-2">Max Results</label>
-              <input
-                type="number"
-                value={maxNotices}
-                onChange={(e) => setMaxNotices(Number(e.target.value))}
-                className="w-full px-3 py-1 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
-                min="1"
-                max="500"
-              />
+            <div className="bg-white rounded-xl border border-gray-200 p-5">
+              <div className="flex items-center justify-between mb-3">
+                <span className="text-xs font-medium text-gray-400 uppercase tracking-wider">
+                  All Time
+                </span>
+                <span className="w-8 h-8 rounded-lg bg-gray-100 flex items-center justify-center">
+                  <svg
+                    className="w-4 h-4 text-gray-600"
+                    fill="none"
+                    stroke="currentColor"
+                    viewBox="0 0 24 24"
+                    strokeWidth={2}
+                  >
+                    <path
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      d="M4 7v10c0 2.21 3.582 4 8 4s8-1.79 8-4V7M4 7c0 2.21 3.582 4 8 4s8-1.79 8-4M4 7c0-2.21 3.582-4 8-4s8 1.79 8 4"
+                    />
+                  </svg>
+                </span>
+              </div>
+              <div className="text-3xl font-bold text-gray-900">
+                {stats.allTime}
+              </div>
+              <div className="text-xs text-gray-400 mt-2">total records</div>
             </div>
 
-            <div>
-              <label className="block text-sm font-medium text-gray-700 mb-2">Status</label>
-              <select
-                value={showLeftSchool}
-                onChange={(e) => setShowLeftSchool(e.target.value)}
-                className="w-full px-3 py-1 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
-              >
-                <option value="all">All</option>
-                <option value="pending">Pending (Not Left)</option>
-                <option value="left">Left School</option>
-              </select>
+            <div className="bg-white rounded-xl border border-gray-200 p-5">
+              <div className="flex items-center justify-between mb-3">
+                <span className="text-xs font-medium text-gray-400 uppercase tracking-wider">
+                  Pending Now
+                </span>
+                <span className="w-8 h-8 rounded-lg bg-yellow-50 flex items-center justify-center">
+                  <svg
+                    className="w-4 h-4 text-yellow-600"
+                    fill="none"
+                    stroke="currentColor"
+                    viewBox="0 0 24 24"
+                    strokeWidth={2}
+                  >
+                    <path
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"
+                    />
+                  </svg>
+                </span>
+              </div>
+              <div className="text-3xl font-bold text-yellow-600">
+                {stats.todayPending}
+              </div>
+              <div className="text-xs text-gray-400 mt-2">
+                awaiting pickup
+              </div>
             </div>
           </div>
 
-          {/* Second Row */}
-          <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-4">
-            <div>
-              <label className="block text-sm font-medium text-gray-700 mb-2">Grade Level</label>
-              <div className="space-y-2 border border-gray-300 rounded-lg p-2 bg-white">
-                {[
-                  { value: "elementary", label: "Elementary (1-5)", color: "bg-green-500" },
-                  { value: "middle", label: "Middle (6-8)", color: "bg-orange-500" },
-                  { value: "high", label: "High (9-12)", color: "bg-blue-500" },
-                ].map((level) => (
-                  <label key={level.value} className="flex items-center gap-2 cursor-pointer">
-                    <input
-                      type="checkbox"
-                      checked={selectedGradeLevels.includes(level.value)}
-                      onChange={(e) => {
-                        if (e.target.checked) {
-                          setSelectedGradeLevels([...selectedGradeLevels, level.value]);
-                        } else {
-                          setSelectedGradeLevels(selectedGradeLevels.filter((l) => l !== level.value));
-                        }
-                      }}
-                      className="w-4 h-4"
-                    />
-                    <span className={`w-3 h-3 rounded-full ${level.color}`}></span>
-                    <span className="text-sm text-gray-700">{level.label}</span>
-                  </label>
-                ))}
+          {/* Search + Filter Bar */}
+          <div className="bg-white rounded-xl border border-gray-200">
+            <div className="p-4 flex items-center gap-3">
+              {/* Search */}
+              <div className="relative flex-1">
+                <svg
+                  className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400"
+                  fill="none"
+                  stroke="currentColor"
+                  viewBox="0 0 24 24"
+                  strokeWidth={2}
+                >
+                  <path
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"
+                  />
+                </svg>
+                <input
+                  type="text"
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                  placeholder="Search by name, plate, or car..."
+                  className="w-full pl-10 pr-4 py-2 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                />
               </div>
-            </div>
 
-            <div>
-              <label className="block text-sm font-medium text-gray-700 mb-2">Person Type</label>
-              <div className="space-y-2 max-h-32 overflow-y-auto border border-gray-300 rounded-lg p-2 bg-white">
-                {["parent", "student", "teacher/staff", "unknown"].map((type) => (
-                  <label key={type} className="flex items-center gap-2 cursor-pointer">
-                    <input
-                      type="checkbox"
-                      checked={selectedPersonTypes.includes(type)}
-                      onChange={(e) => {
-                        if (e.target.checked) {
-                          setSelectedPersonTypes([...selectedPersonTypes, type]);
-                        } else {
-                          setSelectedPersonTypes(selectedPersonTypes.filter((t) => t !== type));
-                        }
-                      }}
-                      className="w-4 h-4"
-                    />
-                    <span className="text-sm text-gray-700 capitalize">{type}</span>
-                  </label>
-                ))}
-              </div>
-            </div>
-
-            <div>
-              <label className="block text-sm font-medium text-gray-700 mb-2">Enter/Exit</label>
-              <div className="flex gap-3 border border-gray-300 rounded-lg p-2 bg-white">
-                {["entry", "exit"].map((type) => (
-                  <label key={type} className="flex items-center gap-2 cursor-pointer">
-                    <input
-                      type="checkbox"
-                      checked={selectedEnterExit.includes(type)}
-                      onChange={(e) => {
-                        if (e.target.checked) {
-                          setSelectedEnterExit([...selectedEnterExit, type]);
-                        } else {
-                          setSelectedEnterExit(selectedEnterExit.filter((t) => t !== type));
-                        }
-                      }}
-                      className="w-4 h-4"
-                    />
-                    <span className="text-sm text-gray-700 capitalize">{type}</span>
-                  </label>
-                ))}
-              </div>
-            </div>
-
-            <div>
-              <label className="block text-sm font-medium text-gray-700 mb-2">Entrance Location</label>
-              <div className="space-y-2 max-h-32 overflow-y-auto border border-gray-300 rounded-lg p-2 bg-white">
-                {entranceLocations.map((location, index) => (
-                  <div key={index}>
-                    {editingLocationIndex === index ? (
-                      <div className="flex gap-2 mb-2">
-                        <input
-                          type="text"
-                          value={editingLocationValue}
-                          onChange={(e) => setEditingLocationValue(e.target.value)}
-                          onBlur={() => {
-                            if (editingLocationValue.trim()) {
-                              const newLocations = [...entranceLocations];
-                              newLocations[index] = editingLocationValue;
-                              setEntranceLocations(newLocations);
-                            }
-                            setEditingLocationIndex(null);
-                          }}
-                          onKeyDown={(e) => {
-                            if (e.key === "Enter") {
-                              if (editingLocationValue.trim()) {
-                                const newLocations = [...entranceLocations];
-                                newLocations[index] = editingLocationValue;
-                                setEntranceLocations(newLocations);
-                              }
-                              setEditingLocationIndex(null);
-                            }
-                          }}
-                          className="flex-1 px-2 py-1 border border-gray-300 rounded text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
-                          autoFocus
-                        />
-                      </div>
-                    ) : (
-                      <label className="flex items-center gap-2 cursor-pointer">
-                        <input
-                          type="checkbox"
-                          checked={selectedEntranceLocations.includes(location)}
-                          onChange={(e) => {
-                            if (e.target.checked) {
-                              setSelectedEntranceLocations([...selectedEntranceLocations, location]);
-                            } else {
-                              setSelectedEntranceLocations(
-                                selectedEntranceLocations.filter((l) => l !== location)
-                              );
-                            }
-                          }}
-                          className="w-4 h-4"
-                        />
-                        <span className="text-sm text-gray-700 flex-1">{location}</span>
-                        <button
-                          onClick={() => {
-                            setEditingLocationIndex(index);
-                            setEditingLocationValue(location);
-                          }}
-                          className="text-gray-500 hover:text-gray-700 px-1"
-                          title="Edit location"
-                        >
-                          ✎
-                        </button>
-                        <button
-                          onClick={() => {
-                            const newLocations = entranceLocations.filter((_, i) => i !== index);
-                            setEntranceLocations(newLocations);
-                            setSelectedEntranceLocations(
-                              selectedEntranceLocations.filter((l) => l !== location)
-                            );
-                          }}
-                          className="text-gray-500 hover:text-red-600 px-1"
-                          title="Remove location"
-                        >
-                          ✕
-                        </button>
-                      </label>
-                    )}
-                  </div>
-                ))}
-              </div>
+              {/* Filter Toggle */}
               <button
-                onClick={() => {
-                  const newLocation = `Entrance ${entranceLocations.length + 1}`;
-                  setEntranceLocations([...entranceLocations, newLocation]);
-                }}
-                className="text-sm font-medium mt-2"
-                style={{ color: "#004191" }}
+                onClick={() => setFiltersOpen(!filtersOpen)}
+                className={`flex items-center gap-2 px-4 py-2 text-sm font-medium rounded-lg border transition ${
+                  filtersOpen || activeFilterCount > 0
+                    ? "bg-blue-50 border-blue-200 text-blue-700"
+                    : "bg-white border-gray-200 text-gray-600 hover:bg-gray-50"
+                }`}
               >
-                + Add Location
+                <svg
+                  className="w-4 h-4"
+                  fill="none"
+                  stroke="currentColor"
+                  viewBox="0 0 24 24"
+                  strokeWidth={2}
+                >
+                  <path
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    d="M3 4a1 1 0 011-1h16a1 1 0 011 1v2.586a1 1 0 01-.293.707l-6.414 6.414a1 1 0 00-.293.707V17l-4 4v-6.586a1 1 0 00-.293-.707L3.293 7.293A1 1 0 013 6.586V4z"
+                  />
+                </svg>
+                Filters
+                {activeFilterCount > 0 && (
+                  <span className="w-5 h-5 rounded-full bg-blue-600 text-white text-xs flex items-center justify-center">
+                    {activeFilterCount}
+                  </span>
+                )}
+              </button>
+
+              {/* Export */}
+              <button
+                onClick={() => exportToCsv(filteredNotices)}
+                disabled={filteredNotices.length === 0}
+                className="flex items-center gap-2 px-4 py-2 text-sm font-medium rounded-lg border border-gray-200 text-gray-600 hover:bg-gray-50 transition disabled:opacity-40 disabled:cursor-not-allowed"
+              >
+                <svg
+                  className="w-4 h-4"
+                  fill="none"
+                  stroke="currentColor"
+                  viewBox="0 0 24 24"
+                  strokeWidth={2}
+                >
+                  <path
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"
+                  />
+                </svg>
+                Export
               </button>
             </div>
+
+            {/* Expandable Filters */}
+            {filtersOpen && (
+              <div className="px-4 pb-4 pt-1 border-t border-gray-100">
+                <div className="grid grid-cols-2 lg:grid-cols-5 gap-4 mt-3">
+                  <div>
+                    <label className="block text-xs font-medium text-gray-500 mb-1.5">
+                      Date Range
+                    </label>
+                    <div className="flex gap-1.5">
+                      <input
+                        type="date"
+                        value={startDate}
+                        onChange={(e) => setStartDate(e.target.value)}
+                        className="flex-1 px-2.5 py-1.5 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+                      />
+                      <span className="text-gray-300 self-center">-</span>
+                      <input
+                        type="date"
+                        value={endDate}
+                        onChange={(e) => setEndDate(e.target.value)}
+                        className="flex-1 px-2.5 py-1.5 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+                      />
+                    </div>
+                  </div>
+
+                  <div>
+                    <label className="block text-xs font-medium text-gray-500 mb-1.5">
+                      Time Range
+                    </label>
+                    <div className="flex gap-1.5">
+                      <input
+                        type="time"
+                        value={startTime}
+                        onChange={(e) => setStartTime(e.target.value)}
+                        className="flex-1 px-2.5 py-1.5 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+                      />
+                      <span className="text-gray-300 self-center">-</span>
+                      <input
+                        type="time"
+                        value={endTime}
+                        onChange={(e) => setEndTime(e.target.value)}
+                        className="flex-1 px-2.5 py-1.5 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+                      />
+                    </div>
+                  </div>
+
+                  <div>
+                    <label className="block text-xs font-medium text-gray-500 mb-1.5">
+                      Grade Level
+                    </label>
+                    <div className="flex gap-1.5">
+                      {[
+                        {
+                          value: "elementary",
+                          label: "Elem",
+                          color: "green",
+                        },
+                        { value: "middle", label: "Mid", color: "orange" },
+                        { value: "high", label: "High", color: "blue" },
+                      ].map((level) => {
+                        const active = selectedGradeLevels.includes(
+                          level.value,
+                        );
+                        return (
+                          <button
+                            key={level.value}
+                            onClick={() => {
+                              if (active) {
+                                setSelectedGradeLevels(
+                                  selectedGradeLevels.filter(
+                                    (l) => l !== level.value,
+                                  ),
+                                );
+                              } else {
+                                setSelectedGradeLevels([
+                                  ...selectedGradeLevels,
+                                  level.value,
+                                ]);
+                              }
+                            }}
+                            className={`flex-1 px-2 py-1.5 text-xs font-medium rounded-lg border transition ${
+                              active
+                                ? `bg-${level.color}-50 border-${level.color}-200 text-${level.color}-700`
+                                : "bg-white border-gray-200 text-gray-500 hover:bg-gray-50"
+                            }`}
+                            style={
+                              active
+                                ? {
+                                    backgroundColor:
+                                      level.color === "green"
+                                        ? "#f0fdf4"
+                                        : level.color === "orange"
+                                          ? "#fff7ed"
+                                          : "#eff6ff",
+                                    borderColor:
+                                      level.color === "green"
+                                        ? "#bbf7d0"
+                                        : level.color === "orange"
+                                          ? "#fed7aa"
+                                          : "#bfdbfe",
+                                    color:
+                                      level.color === "green"
+                                        ? "#15803d"
+                                        : level.color === "orange"
+                                          ? "#c2410c"
+                                          : "#1d4ed8",
+                                  }
+                                : {}
+                            }
+                          >
+                            {level.label}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+
+                  <div>
+                    <label className="block text-xs font-medium text-gray-500 mb-1.5">
+                      Status
+                    </label>
+                    <div className="flex gap-1.5">
+                      {[
+                        { value: "all", label: "All" },
+                        { value: "pending", label: "Pending" },
+                        { value: "left", label: "Left" },
+                      ].map((opt) => (
+                        <button
+                          key={opt.value}
+                          onClick={() => setShowLeftSchool(opt.value)}
+                          className={`flex-1 px-2 py-1.5 text-xs font-medium rounded-lg border transition ${
+                            showLeftSchool === opt.value
+                              ? "bg-gray-900 border-gray-900 text-white"
+                              : "bg-white border-gray-200 text-gray-500 hover:bg-gray-50"
+                          }`}
+                        >
+                          {opt.label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  {availableLocations.length > 0 && (
+                    <div>
+                      <label className="block text-xs font-medium text-gray-500 mb-1.5">
+                        Location
+                      </label>
+                      <div className="flex flex-wrap gap-1.5">
+                        {availableLocations.map((loc) => {
+                          const active = selectedLocations.includes(loc);
+                          return (
+                            <button
+                              key={loc}
+                              onClick={() => {
+                                if (active) {
+                                  setSelectedLocations(
+                                    selectedLocations.filter((l) => l !== loc),
+                                  );
+                                } else {
+                                  setSelectedLocations([
+                                    ...selectedLocations,
+                                    loc,
+                                  ]);
+                                }
+                              }}
+                              className={`px-2.5 py-1.5 text-xs font-medium rounded-lg border transition ${
+                                active
+                                  ? "bg-indigo-50 border-indigo-200 text-indigo-700"
+                                  : "bg-white border-gray-200 text-gray-500 hover:bg-gray-50"
+                              }`}
+                            >
+                              {loc}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  )}
+                </div>
+
+                {activeFilterCount > 0 && (
+                  <div className="mt-3 flex justify-end">
+                    <button
+                      onClick={resetFilters}
+                      className="text-xs text-gray-500 hover:text-gray-700 transition"
+                    >
+                      Clear all filters
+                    </button>
+                  </div>
+                )}
+              </div>
+            )}
           </div>
 
-          <div className="flex justify-end mt-4">
-            <button
-              onClick={resetFilters}
-              className="px-4 py-2 text-gray-800 rounded-lg bg-gray-200 hover:bg-gray-300 transition"
-            >
-              Reset Filters
-            </button>
-          </div>
-        </div>
-
-        {/* Results Table */}
-        <div className="bg-white rounded-lg shadow overflow-hidden">
-          <div className="p-6 border-b border-gray-200 flex justify-between items-center">
-            <h2 className="text-2xl font-bold">Pickup Notices</h2>
-            <span className="text-gray-600">{filteredNotices.length} results</span>
-          </div>
-
-          <div className="overflow-x-auto">
-            <table className="w-full">
-              <thead className="bg-gray-100 border-b">
-                <tr>
-                  <th className="px-6 py-3 text-left text-sm font-semibold text-gray-700">Status</th>
-                  <th className="px-6 py-3 text-left text-sm font-semibold text-gray-700">Student</th>
-                  <th className="px-6 py-3 text-left text-sm font-semibold text-gray-700">Grade</th>
-                  <th className="px-6 py-3 text-left text-sm font-semibold text-gray-700">License Plate</th>
-                  <th className="px-6 py-3 text-left text-sm font-semibold text-gray-700">Car Description</th>
-                  <th className="px-6 py-3 text-left text-sm font-semibold text-gray-700">Location</th>
-                  <th className="px-6 py-3 text-left text-sm font-semibold text-gray-700">Date</th>
-                  <th className="px-6 py-3 text-left text-sm font-semibold text-gray-700">Time</th>
-                </tr>
-              </thead>
-              <tbody>
-                {filteredNotices.map((notice) => {
-                  const arrivalDate = notice.arrival_time.toDate();
-                  const dateStr = arrivalDate.toLocaleDateString();
-                  const timeStr = arrivalDate.toLocaleTimeString();
-
-                  return (
-                    <tr key={notice.id} className="border-b border-gray-200 hover:bg-gray-50">
-                      <td className="px-6 py-4">
-                        {notice.left_school ? (
-                          <span className="px-2 py-1 rounded-full text-xs font-medium bg-green-100 text-green-800">
-                            Left
-                          </span>
-                        ) : (
-                          <span className="px-2 py-1 rounded-full text-xs font-medium bg-yellow-100 text-yellow-800">
-                            Pending
-                          </span>
-                        )}
-                      </td>
-                      <td className="px-6 py-4 text-sm font-medium text-gray-900">{notice.ward_name}</td>
-                      <td className="px-6 py-4 text-sm text-gray-900">
-                        <GradeBadge grade={notice.student_grade} />
-                      </td>
-                      <td className="px-6 py-4 text-sm text-gray-900">
-                        {notice.license_plate ? (
-                          <span className="font-mono font-bold bg-yellow-100 px-2 py-1 rounded">
-                            {notice.license_plate}
-                          </span>
-                        ) : (
-                          <span className="text-gray-400">N/A</span>
-                        )}
-                      </td>
-                      <td className="px-6 py-4 text-sm text-gray-900">
-                        {notice.car_description || <span className="text-gray-400">No description</span>}
-                      </td>
-                      <td className="px-6 py-4 text-sm text-gray-900">
-                        {notice.entrance_location || <span className="text-gray-400">N/A</span>}
-                      </td>
-                      <td className="px-6 py-4 text-sm text-gray-900">{dateStr}</td>
-                      <td className="px-6 py-4 text-sm text-gray-900">{timeStr}</td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
-
-          {filteredNotices.length === 0 && (
-            <div className="p-6 text-center text-gray-500">
-              No pickup notices found matching the selected filters.
+          {/* Results Table */}
+          <div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
+            {/* Table Header */}
+            <div className="px-6 py-3 bg-gray-50 border-b border-gray-200 flex items-center justify-between">
+              <span className="text-xs font-medium text-gray-500 uppercase tracking-wider">
+                {filteredNotices.length} record
+                {filteredNotices.length !== 1 ? "s" : ""}
+                {searchQuery && ` matching "${searchQuery}"`}
+              </span>
             </div>
-          )}
+
+            <div className="overflow-x-auto">
+              <table className="w-full">
+                <thead>
+                  <tr className="border-b border-gray-100">
+                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">
+                      Status
+                    </th>
+                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">
+                      Student
+                    </th>
+                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">
+                      Grade
+                    </th>
+                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">
+                      Vehicle
+                    </th>
+                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">
+                      Location
+                    </th>
+                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">
+                      Date & Time
+                    </th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-gray-50">
+                  {pagedNotices.map((notice) => {
+                    const d = notice.arrival_time.toDate();
+                    const dateStr = d.toLocaleDateString([], {
+                      month: "short",
+                      day: "numeric",
+                    });
+                    const timeStr = d.toLocaleTimeString([], {
+                      hour: "2-digit",
+                      minute: "2-digit",
+                    });
+
+                    return (
+                      <tr
+                        key={notice.id}
+                        className="hover:bg-gray-50 transition-colors"
+                      >
+                        <td className="px-6 py-3.5">
+                          {notice.left_school ? (
+                            <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium bg-green-50 text-green-700 border border-green-100">
+                              <span className="w-1.5 h-1.5 rounded-full bg-green-500" />
+                              Left
+                            </span>
+                          ) : (
+                            <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium bg-yellow-50 text-yellow-700 border border-yellow-100">
+                              <span className="w-1.5 h-1.5 rounded-full bg-yellow-500" />
+                              Pending
+                            </span>
+                          )}
+                        </td>
+                        <td className="px-6 py-3.5">
+                          <span className="text-sm font-medium text-gray-900">
+                            {notice.ward_name}
+                          </span>
+                        </td>
+                        <td className="px-6 py-3.5">
+                          <GradeBadge grade={notice.student_grade} />
+                        </td>
+                        <td className="px-6 py-3.5">
+                          {notice.license_plate ? (
+                            <div className="flex items-center gap-2">
+                              <span className="font-mono text-xs font-bold bg-gray-100 px-2 py-1 rounded">
+                                {notice.license_plate}
+                              </span>
+                              {notice.car_description && (
+                                <span className="text-xs text-gray-400 truncate max-w-[120px]">
+                                  {notice.car_description}
+                                </span>
+                              )}
+                            </div>
+                          ) : (
+                            <span className="text-xs text-gray-300">--</span>
+                          )}
+                        </td>
+                        <td className="px-6 py-3.5">
+                          {notice.entrance_location ? (
+                            <span className="text-xs text-gray-600">
+                              {notice.entrance_location}
+                            </span>
+                          ) : (
+                            <span className="text-xs text-gray-300">--</span>
+                          )}
+                        </td>
+                        <td className="px-6 py-3.5">
+                          <div className="text-sm text-gray-900">
+                            {dateStr}
+                          </div>
+                          <div className="text-xs text-gray-400">
+                            {timeStr}
+                          </div>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+
+            {filteredNotices.length === 0 && (
+              <div className="py-16 text-center">
+                <svg
+                  className="w-12 h-12 mx-auto text-gray-200 mb-3"
+                  fill="none"
+                  stroke="currentColor"
+                  viewBox="0 0 24 24"
+                  strokeWidth={1}
+                >
+                  <path
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2"
+                  />
+                </svg>
+                <p className="text-sm text-gray-400">
+                  No records match your filters.
+                </p>
+                {activeFilterCount > 0 && (
+                  <button
+                    onClick={resetFilters}
+                    className="mt-2 text-xs text-blue-600 hover:text-blue-700"
+                  >
+                    Clear filters
+                  </button>
+                )}
+              </div>
+            )}
+
+            {/* Pagination */}
+            {filteredNotices.length > PAGE_SIZE && (
+              <div className="px-6 py-3 border-t border-gray-100 flex items-center justify-between">
+                <span className="text-xs text-gray-400">
+                  {(currentPage - 1) * PAGE_SIZE + 1}–
+                  {Math.min(currentPage * PAGE_SIZE, filteredNotices.length)} of{" "}
+                  {filteredNotices.length}
+                </span>
+                <div className="flex items-center gap-1">
+                  <button
+                    onClick={() =>
+                      setCurrentPage((p) => Math.max(1, p - 1))
+                    }
+                    disabled={currentPage === 1}
+                    className="px-3 py-1.5 rounded-lg text-xs font-medium text-gray-600 hover:bg-gray-100 disabled:opacity-30 disabled:cursor-not-allowed transition"
+                  >
+                    Previous
+                  </button>
+                  <span className="px-3 py-1.5 text-xs text-gray-500">
+                    {currentPage} / {totalPages}
+                  </span>
+                  <button
+                    onClick={() =>
+                      setCurrentPage((p) => Math.min(totalPages, p + 1))
+                    }
+                    disabled={currentPage === totalPages}
+                    className="px-3 py-1.5 rounded-lg text-xs font-medium text-gray-600 hover:bg-gray-100 disabled:opacity-30 disabled:cursor-not-allowed transition"
+                  >
+                    Next
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
         </div>
       </div>
     </div>
