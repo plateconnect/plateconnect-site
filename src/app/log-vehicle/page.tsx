@@ -39,6 +39,7 @@ export default function LogVehiclePage() {
   const [students, setStudents] = useState<Map<string, Student>>(new Map());
   const [vehicles, setVehicles] = useState<VehicleEntry[]>([]);
   const [searchQuery, setSearchQuery] = useState("");
+  const [sort, setSort] = useState<{column: "licensePlate" | "guardianName" | "linkedStudents" | null; direction: "asc" | "desc" | null}>({ column: null, direction: null });
   const [filteredVehicles, setFilteredVehicles] = useState<VehicleEntry[]>([]);
 
   useEffect(() => {
@@ -119,22 +120,48 @@ export default function LogVehiclePage() {
     setVehicles(vehicleEntries);
   }, [guardians, students]);
 
-  // Filter vehicles by search query
-  useEffect(() => {
-    if (!searchQuery.trim()) {
-      setFilteredVehicles(vehicles);
-      return;
-    }
+  const cycleSort = (column: "licensePlate" | "guardianName" | "linkedStudents") => {
+    setSort((prev) => {
+      if (prev.column !== column) return { column, direction: "asc" };
+      if (prev.direction === "asc") return { column, direction: "desc" };
+      return { column: null, direction: null };
+    });
+  };
 
-    const q = searchQuery.toLowerCase();
-    const filtered = vehicles.filter(
+  // Filter and sort vehicles by search query and selected column
+  useEffect(() => {
+    const q = searchQuery.toLowerCase().trim();
+    let filtered = vehicles.filter(
       (v) =>
         v.licensePlate.toLowerCase().includes(q) ||
         v.guardianName.toLowerCase().includes(q) ||
         v.carDescription.toLowerCase().includes(q)
     );
+
+    if (sort.column && sort.direction) {
+      filtered = [...filtered].sort((a, b) => {
+        let aValue: string | number = "";
+        let bValue: string | number = "";
+
+        if (sort.column === "licensePlate") {
+          aValue = a.licensePlate.toLowerCase();
+          bValue = b.licensePlate.toLowerCase();
+        } else if (sort.column === "guardianName") {
+          aValue = a.guardianName.toLowerCase();
+          bValue = b.guardianName.toLowerCase();
+        } else if (sort.column === "linkedStudents") {
+          aValue = a.linkedStudents.length;
+          bValue = b.linkedStudents.length;
+        }
+
+        if (aValue < bValue) return sort.direction === "asc" ? -1 : 1;
+        if (aValue > bValue) return sort.direction === "asc" ? 1 : -1;
+        return 0;
+      });
+    }
+
     setFilteredVehicles(filtered);
-  }, [vehicles, searchQuery]);
+  }, [vehicles, searchQuery, sort]);
 
   // Guardians with no vehicles registered
   const guardiansWithNoVehicles = useMemo(
@@ -205,16 +232,55 @@ export default function LogVehiclePage() {
               <thead className="bg-gray-100 border-b">
                 <tr>
                   <th className="px-6 py-3 text-left text-sm font-semibold text-gray-700">
-                    License Plate
+                    <div className="flex items-center gap-2">
+                      <span>License Plate</span>
+                      <button
+                        onClick={() => cycleSort("licensePlate")}
+                        className={`inline-flex items-center justify-center w-5 h-5 rounded border border-gray-300 text-[10px] ${
+                          sort.column === "licensePlate" && sort.direction
+                            ? "bg-green-500 border-green-500 text-white"
+                            : "bg-white text-gray-500 hover:bg-gray-100"
+                        }`}
+                        aria-label="Sort by license plate"
+                      >
+                        {sort.column === "licensePlate" && sort.direction === "asc" ? "▲" : sort.column === "licensePlate" && sort.direction === "desc" ? "▼" : "△"}
+                      </button>
+                    </div>
                   </th>
                   <th className="px-6 py-3 text-left text-sm font-semibold text-gray-700">
-                    Parent Name
+                    <div className="flex items-center gap-2">
+                      <span>Parent Name</span>
+                      <button
+                        onClick={() => cycleSort("guardianName")}
+                        className={`inline-flex items-center justify-center w-5 h-5 rounded border border-gray-300 text-[10px] ${
+                          sort.column === "guardianName" && sort.direction
+                            ? "bg-green-500 border-green-500 text-white"
+                            : "bg-white text-gray-500 hover:bg-gray-100"
+                        }`}
+                        aria-label="Sort by parent name"
+                      >
+                        {sort.column === "guardianName" && sort.direction === "asc" ? "▲" : sort.column === "guardianName" && sort.direction === "desc" ? "▼" : "△"}
+                      </button>
+                    </div>
                   </th>
                   <th className="px-6 py-3 text-left text-sm font-semibold text-gray-700">
                     Car Description
                   </th>
                   <th className="px-6 py-3 text-left text-sm font-semibold text-gray-700">
-                    Linked Students
+                    <div className="flex items-center gap-2">
+                      <span>Linked Students</span>
+                      <button
+                        onClick={() => cycleSort("linkedStudents")}
+                        className={`inline-flex items-center justify-center w-5 h-5 rounded border border-gray-300 text-[10px] ${
+                          sort.column === "linkedStudents" && sort.direction
+                            ? "bg-green-500 border-green-500 text-white"
+                            : "bg-white text-gray-500 hover:bg-gray-100"
+                        }`}
+                        aria-label="Sort by linked students"
+                      >
+                        {sort.column === "linkedStudents" && sort.direction === "asc" ? "▲" : sort.column === "linkedStudents" && sort.direction === "desc" ? "▼" : "△"}
+                      </button>
+                    </div>
                   </th>
                   <th className="px-6 py-3 text-left text-sm font-semibold text-gray-700">
                     Actions
@@ -259,10 +325,10 @@ export default function LogVehiclePage() {
                     </td>
                     <td className="px-6 py-4">
                       <Link
-                        href={`/admin/users?guardian=${vehicle.guardianId}`}
+                        href={`/users?guardian=${vehicle.guardianId}`}
                         className="text-blue-600 hover:underline text-sm font-medium"
                       >
-                        View guardian
+                        view image
                       </Link>
                     </td>
                   </tr>
@@ -330,7 +396,7 @@ export default function LogVehiclePage() {
                   <span>{g.name}</span>
                   {g.email && <span className="text-yellow-500">({g.email})</span>}
                   <Link
-                    href={`/admin/users?guardian=${g.id}`}
+                    href={`/users?guardian=${g.id}`}
                     className="text-yellow-800 underline text-xs ml-1"
                   >
                     View

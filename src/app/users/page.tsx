@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useMemo, Suspense, Fragment } from "react";
+import { useState, useEffect, useMemo, Suspense } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { useAuth } from "@/context/AuthContext";
 import { db } from "@/lib/firebase";
@@ -472,6 +472,7 @@ function UserManagementContent() {
       if (av > bv) return sort.direction === "asc" ? 1 : -1;
       return 0;
     });
+
     return sorted;
   }, [allUsers, filter, searchQuery, sort]);
 
@@ -684,8 +685,9 @@ function UserManagementContent() {
                     : [];
 
                   return (
-                    <Fragment key={u.id}>
+                    <>
                       <tr
+                        key={u.id}
                         className={`border-b border-gray-100 hover:bg-gray-50 transition-colors ${
                           isExpanded ? "bg-blue-50 hover:bg-blue-50" : ""
                         }`}
@@ -807,7 +809,7 @@ function UserManagementContent() {
                           </td>
                         </tr>
                       )}
-                    </Fragment>
+                    </>
                   );
                 })}
               </tbody>
