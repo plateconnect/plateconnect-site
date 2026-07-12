@@ -163,7 +163,7 @@ export default function AdminDashboardPage() {
 
   useEffect(() => {
     if (!user || !db) return;
-    const q = query(collection(db, "notices"), orderBy("arrival_time", "desc"));
+    const q = query(collection(db, "arrivals"), orderBy("arrival_time", "desc"));
     const unsubscribe = onSnapshot(q, (snapshot) => {
       const noticesData: Notice[] = [];
       snapshot.forEach((doc) => {
