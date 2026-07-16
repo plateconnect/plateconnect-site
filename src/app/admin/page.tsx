@@ -16,31 +16,91 @@ import Sidebar from "@/components/Sidebar";
 interface Notice {
   id: string;
   arrival_time: Timestamp;
-  ward_name: string;
-  student_grade: number;
+  ward_names: string[];
   owner_id: string;
   license_plate?: string;
-  car_description?: string;
-  ward_id?: string;
+  image_url?: string;
+  ward_ids?: string[];
   person_type?: string;
   entrance_location?: string;
-  action_type?: string;
-  left_school?: boolean;
+  status?: string;
+  departure_time?: Timestamp;
+}
+
+function groupArrivals(raw: Notice[]): Notice[] {
+  const byKey = new Map<string, Notice[]>();
+  const passthrough: Notice[] = [];
+
+  for (const n of raw) {
+    if (!n.license_plate) {
+      passthrough.push(n);
+      continue;
+    }
+    const day = n.arrival_time.toDate().toISOString().split("T")[0];
+    const key = `${n.license_plate.toLowerCase()}_${day}`;
+    if (!byKey.has(key)) byKey.set(key, []);
+    byKey.get(key)!.push(n);
+  }
+
+  const result: Notice[] = [...passthrough];
+
+  for (const group of byKey.values()) {
+    const sorted = [...group].sort((a, b) => a.arrival_time.toMillis() - b.arrival_time.toMillis());
+    const pendingArrivals: Notice[] = [];
+    for (const n of sorted) {
+      const status = (n.status || "").toLowerCase();
+      if (status === "left" && pendingArrivals.length > 0) {
+        const arrived = pendingArrivals.shift()!;
+        result.push({ ...arrived, status: "left", departure_time: n.arrival_time });
+      } else if (status === "arrived") {
+        pendingArrivals.push(n);
+      } else {
+        result.push(n);
+      }
+    }
+    result.push(...pendingArrivals);
+  }
+
+  return result.sort((a, b) => b.arrival_time.toMillis() - a.arrival_time.toMillis());
+}
+
+function formatDateShort(d: Date) {
+  return `${d.getMonth() + 1}/${String(d.getDate()).padStart(2, "0")}/${String(d.getFullYear()).slice(-2)}`;
+}
+
+function formatTimeShort(d: Date) {
+  return d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+}
+
+function formatElapsed(startMs: number, endMs: number) {
+  const totalMin = Math.max(0, Math.round((endMs - startMs) / 60000));
+  const h = Math.floor(totalMin / 60);
+  const m = totalMin % 60;
+  if (h === 0) return `${m}m`;
+  if (m === 0) return `${h}h`;
+  return `${h}h ${m}m`;
 }
 
 type ExportScope = "current-filter" | "today" | "this-week" | "all";
 
+function statusLabel(status?: string) {
+  const key = (status || "").toLowerCase();
+  if (key === "arrived") return "Arrived";
+  if (key === "left") return "Left";
+  return "Not set";
+}
+
 function exportToCsv(rows: Notice[], scope: ExportScope) {
-  const headers = ["Type", "Name", "License Plate", "Car Description", "Location", "Status", "Date", "Time"];
+  const headers = ["Type", "Name", "License Plate", "Location", "Status", "Image URL", "Date", "Time"];
   const lines = rows.map((n) => {
     const d = n.arrival_time.toDate();
     return [
       n.person_type ?? "unknown",
-      n.ward_name,
+      n.ward_names.join(", "),
       n.license_plate ?? "",
-      n.car_description ?? "",
       n.entrance_location ?? "",
-      n.left_school ? "Left" : "Pending",
+      statusLabel(n.status),
+      n.image_url ?? "",
       d.toLocaleDateString(),
       d.toLocaleTimeString(),
     ]
@@ -87,6 +147,65 @@ function PersonTypeBadge({ type }: { type?: string }) {
     <span className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-semibold capitalize ${style.bg} ${style.text}`}>
       <span className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${style.dot}`} />
       {key}
+    </span>
+  );
+}
+
+function StatusBadge({ status }: { status?: string }) {
+  const key = (status || "").toLowerCase();
+  if (key === "arrived") {
+    return (
+      <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium bg-yellow-50 text-yellow-700 border border-yellow-100">
+        <span className="w-1.5 h-1.5 rounded-full bg-yellow-500" />Arrived
+      </span>
+    );
+  }
+  if (key === "left") {
+    return (
+      <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium bg-green-50 text-green-700 border border-green-100">
+        <span className="w-1.5 h-1.5 rounded-full bg-green-500" />Left
+      </span>
+    );
+  }
+  return (
+    <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium bg-gray-100 text-gray-500 border border-gray-200">
+      <span className="w-1.5 h-1.5 rounded-full bg-gray-300" />Not set
+    </span>
+  );
+}
+
+function TimeRangeCell({ arrival, departure }: { arrival: Date; departure?: Date }) {
+  const [showElapsed, setShowElapsed] = useState(false);
+  const dateStr = formatDateShort(arrival);
+  const startStr = formatTimeShort(arrival);
+
+  if (!departure) {
+    return <span className="text-sm text-gray-900 whitespace-nowrap">{dateStr} {startStr}</span>;
+  }
+
+  const endStr = formatTimeShort(departure);
+  const elapsed = formatElapsed(arrival.getTime(), departure.getTime());
+
+  return (
+    <span className="text-sm text-gray-900 whitespace-nowrap inline-flex items-center gap-1">
+      {dateStr} {startStr}
+      <span className="relative inline-flex">
+        <button
+          type="button"
+          onMouseEnter={() => setShowElapsed(true)}
+          onMouseLeave={() => setShowElapsed(false)}
+          onClick={() => setShowElapsed((v) => !v)}
+          className="px-0.5 text-gray-400 hover:text-blue-600 transition"
+        >
+          -
+        </button>
+        {showElapsed && (
+          <span className="absolute z-10 bottom-full left-1/2 -translate-x-1/2 mb-1 whitespace-nowrap rounded bg-gray-900 px-1.5 py-0.5 text-[10px] font-medium text-white">
+            {elapsed}
+          </span>
+        )}
+      </span>
+      {endStr}
     </span>
   );
 }
@@ -144,9 +263,8 @@ export default function AdminDashboardPage() {
   const [endDate, setEndDate] = useState("");
   const [startTime, setStartTime] = useState("");
   const [endTime, setEndTime] = useState("");
-  const [selectedGradeLevels, setSelectedGradeLevels] = useState<string[]>([]);
-  const [showLeftSchool, setShowLeftSchool] = useState<string>("all");
   const [searchQuery, setSearchQuery] = useState("");
+  const [statusFilter, setStatusFilter] = useState<string>("all");
   const [selectedLocations, setSelectedLocations] = useState<string[]>([]);
   const [selectedPersonTypes, setSelectedPersonTypes] = useState<string[]>([]);
   const [exportModalOpen, setExportModalOpen] = useState(false);
@@ -171,16 +289,14 @@ export default function AdminDashboardPage() {
         noticesData.push({
           id: doc.id,
           arrival_time: data.arrival_time,
-          ward_name: data.ward_name || "Unknown",
-          student_grade: data.student_grade || 0,
+          ward_names: data.ward_names || [],
           owner_id: data.owner_id,
-          license_plate: data.licensePlate ?? data.license_plate,
-          car_description: data.car_description,
-          ward_id: data.ward_id,
+          license_plate: data.licensePlate,
+          image_url: data.image_url,
+          ward_ids: data.ward_ids,
           person_type: data.person_type || "unknown",
-          action_type: data.action_type || "entry",
-          entrance_location: data.entrance_location ?? data.location,
-          left_school: data.left_school || false,
+          entrance_location: data.entrance_location,
+          status: data.status,
         });
       });
       setNotices(noticesData);
@@ -189,23 +305,25 @@ export default function AdminDashboardPage() {
     return () => unsubscribe();
   }, [user]);
 
+  const groupedNotices = useMemo(() => groupArrivals(notices), [notices]);
+
   const stats = useMemo(() => {
     const todayStart = new Date();
     todayStart.setHours(0, 0, 0, 0);
     const todayMs = todayStart.getTime();
-    const today = notices.filter((n) => n.arrival_time.toMillis() >= todayMs);
+    const today = groupedNotices.filter((n) => n.arrival_time.toMillis() >= todayMs);
     const weekStart = new Date();
     weekStart.setDate(weekStart.getDate() - weekStart.getDay());
     weekStart.setHours(0, 0, 0, 0);
-    const thisWeek = notices.filter((n) => n.arrival_time.toMillis() >= weekStart.getTime());
+    const thisWeek = groupedNotices.filter((n) => n.arrival_time.toMillis() >= weekStart.getTime());
     return {
       todayTotal: today.length,
-      todayPending: today.filter((n) => !n.left_school).length,
-      todayLeft: today.filter((n) => n.left_school).length,
+      todayArrived: today.filter((n) => (n.status || "").toLowerCase() === "arrived").length,
+      todayLeft: today.filter((n) => (n.status || "").toLowerCase() === "left").length,
       weekTotal: thisWeek.length,
-      allTime: notices.length,
+      allTime: groupedNotices.length,
     };
-  }, [notices]);
+  }, [groupedNotices]);
 
   const syncLabel = useMemo(() => {
     if (!lastSyncTime) return null;
@@ -216,14 +334,13 @@ export default function AdminDashboardPage() {
   }, [lastSyncTime, now]);
 
   const filteredNotices = useMemo(() => {
-    let filtered = notices;
+    let filtered = groupedNotices;
     if (searchQuery.trim()) {
       const q = searchQuery.toLowerCase();
       filtered = filtered.filter(
         (n) =>
-          n.ward_name.toLowerCase().includes(q) ||
-          (n.license_plate && n.license_plate.toLowerCase().includes(q)) ||
-          (n.car_description && n.car_description.toLowerCase().includes(q))
+          n.ward_names.some((name) => name.toLowerCase().includes(q)) ||
+          (n.license_plate && n.license_plate.toLowerCase().includes(q))
       );
     }
     if (startDate || endDate) {
@@ -243,15 +360,6 @@ export default function AdminDashboardPage() {
         return true;
       });
     }
-    if (selectedGradeLevels.length > 0) {
-      filtered = filtered.filter((n) => {
-        const g = n.student_grade;
-        if (selectedGradeLevels.includes("elementary") && g >= 1 && g <= 5) return true;
-        if (selectedGradeLevels.includes("middle") && g >= 6 && g <= 8) return true;
-        if (selectedGradeLevels.includes("high") && g >= 9 && g <= 12) return true;
-        return false;
-      });
-    }
     if (selectedPersonTypes.length > 0) {
       filtered = filtered.filter((n) =>
         selectedPersonTypes.includes((n.person_type || "unknown").toLowerCase())
@@ -265,34 +373,33 @@ export default function AdminDashboardPage() {
         );
       });
     }
-    if (showLeftSchool === "left") filtered = filtered.filter((n) => n.left_school);
-    else if (showLeftSchool === "pending") filtered = filtered.filter((n) => !n.left_school);
+    if (statusFilter === "arrived") filtered = filtered.filter((n) => (n.status || "").toLowerCase() === "arrived");
+    else if (statusFilter === "left") filtered = filtered.filter((n) => (n.status || "").toLowerCase() === "left");
+    else if (statusFilter === "not-set") filtered = filtered.filter((n) => !["arrived", "left"].includes((n.status || "").toLowerCase()));
     return filtered;
-  }, [notices, searchQuery, startDate, endDate, startTime, endTime, selectedGradeLevels, selectedLocations, selectedPersonTypes, showLeftSchool]);
+  }, [groupedNotices, searchQuery, startDate, endDate, startTime, endTime, selectedLocations, selectedPersonTypes, statusFilter]);
 
   const totalPages = Math.max(1, Math.ceil(filteredNotices.length / PAGE_SIZE));
   const pagedNotices = filteredNotices.slice((currentPage - 1) * PAGE_SIZE, currentPage * PAGE_SIZE);
 
   useEffect(() => {
     setCurrentPage(1);
-  }, [searchQuery, startDate, endDate, startTime, endTime, selectedGradeLevels, selectedLocations, selectedPersonTypes, showLeftSchool]);
+  }, [searchQuery, startDate, endDate, startTime, endTime, selectedLocations, selectedPersonTypes, statusFilter]);
 
   const activeFilterCount = [
     startDate || endDate,
     startTime || endTime,
-    selectedGradeLevels.length > 0,
     selectedLocations.length > 0,
     selectedPersonTypes.length > 0,
-    showLeftSchool !== "all",
+    statusFilter !== "all",
   ].filter(Boolean).length;
 
   const resetFilters = () => {
     setStartDate(""); setEndDate("");
     setStartTime(""); setEndTime("");
-    setSelectedGradeLevels([]);
     setSelectedLocations([]);
     setSelectedPersonTypes([]);
-    setShowLeftSchool("all");
+    setStatusFilter("all");
     setSearchQuery("");
   };
 
@@ -303,17 +410,17 @@ export default function AdminDashboardPage() {
     todayStart.setHours(0, 0, 0, 0);
 
     if (scope === "today") {
-      return notices.filter((n) => n.arrival_time.toMillis() >= todayStart.getTime());
+      return groupedNotices.filter((n) => n.arrival_time.toMillis() >= todayStart.getTime());
     }
 
     const weekStart = new Date(todayStart);
     weekStart.setDate(weekStart.getDate() - weekStart.getDay());
 
     if (scope === "this-week") {
-      return notices.filter((n) => n.arrival_time.toMillis() >= weekStart.getTime());
+      return groupedNotices.filter((n) => n.arrival_time.toMillis() >= weekStart.getTime());
     }
 
-    return notices;
+    return groupedNotices;
   };
 
   const handleExport = () => {
@@ -384,7 +491,7 @@ export default function AdminDashboardPage() {
                 label: "Today", value: stats.todayTotal, icon: (
                   <svg className="w-4 h-4 text-blue-600" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" /></svg>
                 ), iconBg: "bg-blue-50",
-                sub: <div className="flex items-center gap-3 mt-2"><span className="text-xs text-yellow-600 bg-yellow-50 px-2 py-0.5 rounded-full">{stats.todayPending} pending</span><span className="text-xs text-green-600 bg-green-50 px-2 py-0.5 rounded-full">{stats.todayLeft} left</span></div>,
+                sub: <div className="flex items-center gap-3 mt-2"><span className="text-xs text-yellow-600 bg-yellow-50 px-2 py-0.5 rounded-full">{stats.todayArrived} arrived</span><span className="text-xs text-green-600 bg-green-50 px-2 py-0.5 rounded-full">{stats.todayLeft} left</span></div>,
                 color: "text-gray-900",
               },
               {
@@ -402,10 +509,10 @@ export default function AdminDashboardPage() {
                 color: "text-gray-900",
               },
               {
-                label: "Pending Now", value: stats.todayPending, icon: (
+                label: "Awaiting Pickup", value: stats.todayArrived, icon: (
                   <svg className="w-4 h-4 text-yellow-600" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
                 ), iconBg: "bg-yellow-50",
-                sub: <div className="text-xs text-gray-400 mt-2">awaiting pickup</div>,
+                sub: <div className="text-xs text-gray-400 mt-2">on campus</div>,
                 color: "text-yellow-600",
               },
             ].map((s) => (
@@ -427,7 +534,7 @@ export default function AdminDashboardPage() {
                 <svg className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth={2}>
                   <path strokeLinecap="round" strokeLinejoin="round" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
                 </svg>
-                <input type="text" value={searchQuery} onChange={(e) => setSearchQuery(e.target.value)} placeholder="Search by name, plate, or car..." className="w-full pl-10 pr-4 py-2 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent" />
+                <input type="text" value={searchQuery} onChange={(e) => setSearchQuery(e.target.value)} placeholder="Search by name or plate..." className="w-full pl-10 pr-4 py-2 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent" />
               </div>
               <button
                 onClick={() => setFiltersOpen(!filtersOpen)}
@@ -475,27 +582,14 @@ export default function AdminDashboardPage() {
                   <div>
                     <label className="block text-xs font-medium text-gray-500 mb-2">Status</label>
                     <div className="flex gap-1.5">
-                      {[{ value: "all", label: "All" }, { value: "pending", label: "Pending" }, { value: "left", label: "Left" }].map((opt) => (
-                        <button key={opt.value} onClick={() => setShowLeftSchool(opt.value)} className={`flex-1 px-2 py-2 text-xs font-medium rounded-lg border transition ${showLeftSchool === opt.value ? "bg-gray-900 border-gray-900 text-white" : "bg-white border-gray-200 text-gray-500 hover:bg-gray-50"}`}>{opt.label}</button>
+                      {[{ value: "all", label: "All" }, { value: "arrived", label: "Arrived" }, { value: "left", label: "Left" }, { value: "not-set", label: "Not set" }].map((opt) => (
+                        <button key={opt.value} onClick={() => setStatusFilter(opt.value)} className={`flex-1 px-2 py-2 text-xs font-medium rounded-lg border transition ${statusFilter === opt.value ? "bg-gray-900 border-gray-900 text-white" : "bg-white border-gray-200 text-gray-500 hover:bg-gray-50"}`}>{opt.label}</button>
                       ))}
                     </div>
                   </div>
                 </div>
                 <div className="border-t border-gray-100 my-4" />
-                <div className="grid grid-cols-1 md:grid-cols-3 gap-5">
-                  <div>
-                    <label className="block text-xs font-medium text-gray-500 mb-2">Grade Level</label>
-                    <div className="flex gap-1.5">
-                      {[
-                        { value: "elementary", label: "Elementary", style: { backgroundColor: "#f0fdf4", borderColor: "#bbf7d0", color: "#15803d" } },
-                        { value: "middle", label: "Middle", style: { backgroundColor: "#fff7ed", borderColor: "#fed7aa", color: "#c2410c" } },
-                        { value: "high", label: "High", style: { backgroundColor: "#eff6ff", borderColor: "#bfdbfe", color: "#1d4ed8" } },
-                      ].map((level) => {
-                        const active = selectedGradeLevels.includes(level.value);
-                        return <button key={level.value} onClick={() => setSelectedGradeLevels(active ? selectedGradeLevels.filter((l) => l !== level.value) : [...selectedGradeLevels, level.value])} className="flex-1 px-2 py-2 text-xs font-medium rounded-lg border transition" style={active ? level.style : {}}>{level.label}</button>;
-                      })}
-                    </div>
-                  </div>
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
                   <MultiSelectPills label="Person Type" options={PERSON_TYPE_OPTIONS} selected={selectedPersonTypes} onChange={setSelectedPersonTypes} />
                   <MultiSelectPills label="Detection Location" options={LOCATION_OPTIONS} selected={selectedLocations} onChange={setSelectedLocations} />
                 </div>
@@ -516,38 +610,27 @@ export default function AdminDashboardPage() {
                   <tr className="border-b border-gray-200 bg-gray-50">
                     <th className="px-3 py-2.5 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">Status</th>
                     <th className="px-3 py-2.5 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">Type</th>
-                    <th className="px-3 py-2.5 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider whitespace-nowrap">Time & Date</th>
+                    <th className="px-3 py-2.5 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider whitespace-nowrap">Time</th>
                     <th className="px-3 py-2.5 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider whitespace-nowrap">License Plate</th>
                     <th className="px-3 py-2.5 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">Name</th>
-                    <th className="px-3 py-2.5 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">Vehicle</th>
                     <th className="px-3 py-2.5 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">Location</th>
                     <th className="px-3 py-2.5 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">Image</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-gray-50">
                   {pagedNotices.map((notice) => {
-                    const d = notice.arrival_time.toDate();
-                    const dateStr = d.toLocaleDateString([], { month: "short", day: "numeric", year: "numeric" });
-                    const timeStr = d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+                    const arrivalDate = notice.arrival_time.toDate();
+                    const departureDate = notice.departure_time?.toDate();
                     return (
                       <tr key={notice.id} className="hover:bg-gray-50 transition-colors">
                         <td className="px-3 py-2.5">
-                          {notice.left_school ? (
-                            <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium bg-green-50 text-green-700 border border-green-100">
-                              <span className="w-1.5 h-1.5 rounded-full bg-green-500" />Left
-                            </span>
-                          ) : (
-                            <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium bg-yellow-50 text-yellow-700 border border-yellow-100">
-                              <span className="w-1.5 h-1.5 rounded-full bg-yellow-500" />Pending
-                            </span>
-                          )}
+                          <StatusBadge status={notice.status} />
                         </td>
                         <td className="px-3 py-2.5">
                           <PersonTypeBadge type={notice.person_type} />
                         </td>
                         <td className="px-3 py-2.5 whitespace-nowrap">
-                          <span className="text-sm text-gray-900">{dateStr}</span>
-                          <span className="text-xs text-gray-400 ml-1.5">{timeStr}</span>
+                          <TimeRangeCell arrival={arrivalDate} departure={departureDate} />
                         </td>
                         <td className="px-3 py-2.5">
                           {notice.license_plate ? (
@@ -559,14 +642,7 @@ export default function AdminDashboardPage() {
                           )}
                         </td>
                         <td className="px-3 py-2.5">
-                          <span className="text-sm font-medium text-gray-900">{notice.ward_name}</span>
-                        </td>
-                        <td className="px-3 py-2.5">
-                          {notice.car_description ? (
-                            <span className="text-xs text-gray-500 truncate max-w-[140px] block">{notice.car_description}</span>
-                          ) : (
-                            <span className="text-xs text-gray-300">—</span>
-                          )}
+                          <span className="text-sm font-medium text-gray-900">{notice.ward_names.join(", ")}</span>
                         </td>
                         <td className="px-3 py-2.5">
                           {notice.entrance_location ? (
@@ -576,9 +652,13 @@ export default function AdminDashboardPage() {
                           )}
                         </td>
                         <td className="px-3 py-2.5">
-                          <a href="#" className="text-sm text-blue-600 hover:text-blue-700 hover:underline">
-                            View image
-                          </a>
+                          {notice.image_url ? (
+                            <a href={notice.image_url} target="_blank" rel="noopener noreferrer" className="text-sm text-blue-600 hover:text-blue-700 hover:underline">
+                              View image
+                            </a>
+                          ) : (
+                            <span className="text-xs text-gray-300">—</span>
+                          )}
                         </td>
                       </tr>
                     );

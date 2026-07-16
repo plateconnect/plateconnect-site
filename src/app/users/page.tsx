@@ -13,6 +13,7 @@ import {
   deleteDoc,
   addDoc,
   serverTimestamp,
+  writeBatch,
 } from "firebase/firestore";
 import Sidebar from "@/components/Sidebar";
 import GradeBadge from "@/components/GradeBadge";
@@ -69,6 +70,213 @@ function splitCsv(s: string): string[] {
     .split(",")
     .map((v) => v.trim())
     .filter(Boolean);
+}
+
+// ─── CSV Import helpers ──────────────────────────────────────────────────────
+
+// Parse CSV text into headers + rows. Handles UTF-8 BOM, quoted fields with
+// "" escapes, and CRLF/LF line endings.
+function parseCsv(text: string): { headers: string[]; rows: string[][] } {
+  const clean = text.replace(/^﻿/, "");
+  const records: string[][] = [];
+  let field = "";
+  let record: string[] = [];
+  let inQuotes = false;
+
+  for (let i = 0; i < clean.length; i++) {
+    const c = clean[i];
+    if (inQuotes) {
+      if (c === '"') {
+        if (clean[i + 1] === '"') { field += '"'; i++; }
+        else inQuotes = false;
+      } else {
+        field += c;
+      }
+    } else if (c === '"') {
+      inQuotes = true;
+    } else if (c === ",") {
+      record.push(field); field = "";
+    } else if (c === "\n" || c === "\r") {
+      if (c === "\r" && clean[i + 1] === "\n") i++;
+      record.push(field); field = "";
+      records.push(record); record = [];
+    } else {
+      field += c;
+    }
+  }
+  // flush trailing field/record (unless file ended on a newline with no data)
+  if (field.length > 0 || record.length > 0) {
+    record.push(field);
+    records.push(record);
+  }
+
+  // Drop fully-empty rows (e.g. trailing blank lines)
+  const nonEmpty = records.filter((r) => r.some((v) => v.trim() !== ""));
+  if (nonEmpty.length === 0) return { headers: [], rows: [] };
+
+  const headers = nonEmpty[0].map((h) => h.trim().toLowerCase());
+  return { headers, rows: nonEmpty.slice(1) };
+}
+
+// Split a semicolon-separated plates cell → trimmed, uppercased, de-duped.
+function splitPlates(cell: string): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const raw of cell.split(";")) {
+    const p = raw.trim().toUpperCase();
+    if (p && !seen.has(p)) { seen.add(p); out.push(p); }
+  }
+  return out;
+}
+
+// Map possible header spellings → canonical field.
+const IMPORT_HEADER_ALIASES: Record<string, string> = {
+  email: "email",
+  "e-mail": "email",
+  name: "name",
+  "full name": "name",
+  account_type: "account_type",
+  "account type": "account_type",
+  type: "account_type",
+  role: "account_type",
+  license_plates: "license_plates",
+  "license plates": "license_plates",
+  "license plate": "license_plates",
+  plates: "license_plates",
+  plate: "license_plates",
+  grade: "grade",
+};
+
+interface ImportRow {
+  email: string;
+  name: string;
+  account_type: string;
+  plates: string[];
+  grade: string;
+}
+
+type ImportTag = "new" | "existing" | "invalid" | "duplicate";
+
+interface PartitionedRow {
+  rowNumber: number; // 1-based data row (excludes header)
+  data: ImportRow;
+  tag: ImportTag;
+  existingUser?: AppUser;
+  reason?: string;
+}
+
+function buildHeaderIndex(headers: string[]): Record<string, number> {
+  const idx: Record<string, number> = {};
+  headers.forEach((h, i) => {
+    const canon = IMPORT_HEADER_ALIASES[h];
+    if (canon && !(canon in idx)) idx[canon] = i;
+  });
+  return idx;
+}
+
+function normalizeImportRow(headerIdx: Record<string, number>, cols: string[]): ImportRow {
+  const get = (key: string) => {
+    const i = headerIdx[key];
+    return i == null ? "" : (cols[i] ?? "").trim();
+  };
+  return {
+    email: get("email"),
+    name: get("name"),
+    account_type: get("account_type").toLowerCase(),
+    plates: splitPlates(get("license_plates")),
+    grade: get("grade"),
+  };
+}
+
+// Partition parsed rows into new / existing / invalid / duplicate.
+function partitionRows(
+  headers: string[],
+  rows: string[][],
+  existingUsers: AppUser[]
+): { partitioned: PartitionedRow[]; missingHeaders: string[] } {
+  const headerIdx = buildHeaderIndex(headers);
+  const missingHeaders = ["email", "license_plates"].filter((h) => !(h in headerIdx));
+  if (missingHeaders.length > 0) return { partitioned: [], missingHeaders };
+
+  const byEmail = new Map<string, AppUser>();
+  existingUsers.forEach((u) => {
+    if (u.email) byEmail.set(u.email.trim().toLowerCase(), u);
+  });
+
+  const seenInFile = new Set<string>();
+  const partitioned: PartitionedRow[] = rows.map((cols, i) => {
+    const data = normalizeImportRow(headerIdx, cols);
+    const rowNumber = i + 1;
+    const emailKey = data.email.toLowerCase();
+
+    if (!data.email || !data.email.includes("@")) {
+      return { rowNumber, data, tag: "invalid", reason: "Missing or invalid email" };
+    }
+    if (data.plates.length === 0) {
+      return { rowNumber, data, tag: "invalid", reason: "No license plate" };
+    }
+    if (seenInFile.has(emailKey)) {
+      return { rowNumber, data, tag: "duplicate", reason: "Duplicate email in file" };
+    }
+    seenInFile.add(emailKey);
+
+    const existingUser = byEmail.get(emailKey);
+    if (existingUser) {
+      return { rowNumber, data, tag: "existing", existingUser };
+    }
+    return { rowNumber, data, tag: "new" };
+  });
+
+  return { partitioned, missingHeaders: [] };
+}
+
+// Field payload for a new user doc.
+function newUserPayload(data: ImportRow): Record<string, unknown> {
+  const account_type = data.account_type || "guardian";
+  const payload: Record<string, unknown> = {
+    name: data.name || data.email.split("@")[0],
+    email: data.email,
+    account_type,
+    licensePlateNumbers: data.plates,
+    onboardingComplete: false,
+  };
+  if (account_type === "student" && data.grade) {
+    const g = parseInt(data.grade, 10);
+    if (!Number.isNaN(g)) payload.grade = g;
+  }
+  return payload;
+}
+
+// Merge payload for updating an existing user: replace plates; other fields
+// only when non-blank; never touch wardIds/onboardingComplete/fcmToken.
+function updateUserPayload(data: ImportRow, existing: AppUser): Record<string, unknown> {
+  const payload: Record<string, unknown> = {
+    licensePlateNumbers: data.plates, // replace
+  };
+  if (data.name) payload.name = data.name;
+  if (data.account_type) payload.account_type = data.account_type;
+  const resolvedType = data.account_type || existing.account_type;
+  if (resolvedType === "student" && data.grade) {
+    const g = parseInt(data.grade, 10);
+    if (!Number.isNaN(g)) payload.grade = g;
+  }
+  return payload;
+}
+
+const CSV_TEMPLATE =
+  "email,name,account_type,license_plates,grade\n" +
+  "jane@school.edu,Jane Smith,guardian,ABC123;XYZ789,\n" +
+  "drew@school.edu,Drew Lee,student,DL4821,11\n" +
+  "sam@school.edu,,teacher,TCH900,\n";
+
+function downloadCsvTemplate() {
+  const blob = new Blob([CSV_TEMPLATE], { type: "text/csv;charset=utf-8;" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = "user-import-template.csv";
+  a.click();
+  URL.revokeObjectURL(url);
 }
 
 interface UserModalProps {
@@ -359,6 +567,335 @@ function DeleteConfirmModal({
   );
 }
 
+// ─── CSV Import Modal ───────────────────────────────────────────────────────
+
+interface ImportResult {
+  created: number;
+  updated: number;
+  skipped: number;
+}
+
+function ImportModal({
+  existingUsers,
+  onImport,
+  onClose,
+}: {
+  existingUsers: AppUser[];
+  onImport: (rows: PartitionedRow[]) => Promise<ImportResult>;
+  onClose: () => void;
+}) {
+  const [phase, setPhase] = useState<"upload" | "preview" | "result">("upload");
+  const [fileName, setFileName] = useState("");
+  const [partitioned, setPartitioned] = useState<PartitionedRow[]>([]);
+  const [confirmedExisting, setConfirmedExisting] = useState<Set<number>>(new Set());
+  const [parseError, setParseError] = useState("");
+  const [importing, setImporting] = useState(false);
+  const [result, setResult] = useState<ImportResult | null>(null);
+  const [dragging, setDragging] = useState(false);
+
+  const newRows = useMemo(() => partitioned.filter((r) => r.tag === "new"), [partitioned]);
+  const existingRows = useMemo(() => partitioned.filter((r) => r.tag === "existing"), [partitioned]);
+  const skippedRows = useMemo(
+    () => partitioned.filter((r) => r.tag === "invalid" || r.tag === "duplicate"),
+    [partitioned]
+  );
+
+  const allExistingConfirmed = existingRows.length > 0 && confirmedExisting.size === existingRows.length;
+  const importCount = newRows.length + confirmedExisting.size;
+
+  const handleFile = (file: File) => {
+    setParseError("");
+    setFileName(file.name);
+    const reader = new FileReader();
+    reader.onload = () => {
+      const text = String(reader.result ?? "");
+      const { headers, rows } = parseCsv(text);
+      if (rows.length === 0) {
+        setParseError("The file has no data rows.");
+        return;
+      }
+      const { partitioned: parts, missingHeaders } = partitionRows(headers, rows, existingUsers);
+      if (missingHeaders.length > 0) {
+        setParseError(`Missing required column(s): ${missingHeaders.join(", ")}.`);
+        return;
+      }
+      setPartitioned(parts);
+      setConfirmedExisting(new Set());
+      setPhase("preview");
+    };
+    reader.onerror = () => setParseError("Could not read the file.");
+    reader.readAsText(file);
+  };
+
+  const toggleExisting = (rowNumber: number) => {
+    setConfirmedExisting((prev) => {
+      const next = new Set(prev);
+      if (next.has(rowNumber)) next.delete(rowNumber);
+      else next.add(rowNumber);
+      return next;
+    });
+  };
+
+  const toggleAllExisting = () => {
+    setConfirmedExisting(
+      allExistingConfirmed ? new Set() : new Set(existingRows.map((r) => r.rowNumber))
+    );
+  };
+
+  const runImport = async () => {
+    setImporting(true);
+    const toWrite = [
+      ...newRows,
+      ...existingRows.filter((r) => confirmedExisting.has(r.rowNumber)),
+    ];
+    try {
+      const res = await onImport(toWrite);
+      setResult({ ...res, skipped: res.skipped + skippedRows.length });
+      setPhase("result");
+    } catch (e: unknown) {
+      setParseError(e instanceof Error ? e.message : "Import failed.");
+    } finally {
+      setImporting(false);
+    }
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-sm">
+      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-2xl mx-4 overflow-hidden">
+        {/* Header */}
+        <div className="flex items-center justify-between px-6 py-4 border-b border-gray-100">
+          <h2 className="text-lg font-bold text-gray-900">Import Users from CSV</h2>
+          <button
+            onClick={onClose}
+            className="w-8 h-8 rounded-lg flex items-center justify-center text-gray-400 hover:text-gray-600 hover:bg-gray-100 transition"
+          >
+            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth={2}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
+            </svg>
+          </button>
+        </div>
+
+        <div className="px-6 py-5 max-h-[70vh] overflow-y-auto">
+          {/* ── Upload phase ── */}
+          {phase === "upload" && (
+            <div className="space-y-4">
+              <div
+                onDragOver={(e) => { e.preventDefault(); setDragging(true); }}
+                onDragLeave={() => setDragging(false)}
+                onDrop={(e) => {
+                  e.preventDefault();
+                  setDragging(false);
+                  const f = e.dataTransfer.files?.[0];
+                  if (f) handleFile(f);
+                }}
+                className={`border-2 border-dashed rounded-xl px-6 py-10 text-center transition ${
+                  dragging ? "border-blue-400 bg-blue-50" : "border-gray-300 bg-gray-50"
+                }`}
+              >
+                <svg className="w-10 h-10 mx-auto text-gray-400 mb-3" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth={1.5}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5M16.5 12L12 16.5m0 0L7.5 12m4.5 4.5V3" />
+                </svg>
+                <p className="text-sm text-gray-600 mb-3">Drag a .csv file here, or</p>
+                <label className="inline-block px-4 py-2 text-sm font-medium bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition cursor-pointer">
+                  Choose file
+                  <input
+                    type="file"
+                    accept=".csv,text/csv"
+                    className="hidden"
+                    onChange={(e) => {
+                      const f = e.target.files?.[0];
+                      if (f) handleFile(f);
+                    }}
+                  />
+                </label>
+              </div>
+
+              <div className="text-xs text-gray-500 bg-gray-50 rounded-lg px-4 py-3 leading-relaxed">
+                <p className="font-semibold text-gray-600 mb-1">Format</p>
+                <p>
+                  Required columns: <code className="text-gray-700">email</code> and{" "}
+                  <code className="text-gray-700">license_plates</code> (multiple plates separated by
+                  <code className="text-gray-700"> ;</code>).
+                </p>
+                <p>
+                  Optional: <code className="text-gray-700">name</code>,{" "}
+                  <code className="text-gray-700">account_type</code> (blank → guardian),{" "}
+                  <code className="text-gray-700">grade</code> (students).
+                </p>
+                <button
+                  onClick={downloadCsvTemplate}
+                  className="mt-2 text-blue-600 hover:text-blue-700 font-medium"
+                >
+                  Download template
+                </button>
+              </div>
+
+              {parseError && (
+                <p className="text-sm text-red-600 bg-red-50 px-3 py-2 rounded-lg">{parseError}</p>
+              )}
+            </div>
+          )}
+
+          {/* ── Preview phase ── */}
+          {phase === "preview" && (
+            <div className="space-y-4">
+              <div className="flex items-center gap-3 text-sm">
+                <span className="text-gray-500 truncate">{fileName}</span>
+                <button
+                  onClick={() => { setPhase("upload"); setParseError(""); }}
+                  className="ml-auto text-blue-600 hover:text-blue-700 text-xs font-medium shrink-0"
+                >
+                  Choose different file
+                </button>
+              </div>
+
+              <div className="grid grid-cols-3 gap-3">
+                <div className="bg-green-50 border border-green-100 rounded-lg px-3 py-2.5">
+                  <div className="text-2xl font-bold text-green-700">{newRows.length}</div>
+                  <div className="text-xs text-green-600">New</div>
+                </div>
+                <div className="bg-amber-50 border border-amber-100 rounded-lg px-3 py-2.5">
+                  <div className="text-2xl font-bold text-amber-700">{confirmedExisting.size}/{existingRows.length}</div>
+                  <div className="text-xs text-amber-600">To update</div>
+                </div>
+                <div className="bg-gray-50 border border-gray-200 rounded-lg px-3 py-2.5">
+                  <div className="text-2xl font-bold text-gray-500">{skippedRows.length}</div>
+                  <div className="text-xs text-gray-500">Skipped</div>
+                </div>
+              </div>
+
+              {/* Existing users need confirmation */}
+              {existingRows.length > 0 && (
+                <div className="border border-amber-200 rounded-lg overflow-hidden">
+                  <div className="flex items-center justify-between bg-amber-50 px-4 py-2.5">
+                    <p className="text-xs font-semibold text-amber-800">
+                      {existingRows.length} existing user{existingRows.length !== 1 ? "s" : ""} matched by email — confirm to update
+                    </p>
+                    <button
+                      onClick={toggleAllExisting}
+                      className="text-xs font-medium text-amber-800 hover:text-amber-900 underline"
+                    >
+                      {allExistingConfirmed ? "Unconfirm all" : "Confirm all existing"}
+                    </button>
+                  </div>
+                  <div className="divide-y divide-gray-100 max-h-44 overflow-y-auto">
+                    {existingRows.map((r) => (
+                      <label key={r.rowNumber} className="flex items-center gap-3 px-4 py-2.5 hover:bg-gray-50 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={confirmedExisting.has(r.rowNumber)}
+                          onChange={() => toggleExisting(r.rowNumber)}
+                          className="h-4 w-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                        />
+                        <div className="min-w-0 flex-1">
+                          <div className="text-sm font-medium text-gray-800 truncate">
+                            {r.existingUser?.name || r.data.name || r.data.email}
+                          </div>
+                          <div className="text-xs text-gray-400 truncate">
+                            {r.data.email} · plates → {r.data.plates.join(", ")}
+                          </div>
+                        </div>
+                      </label>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* New users preview */}
+              {newRows.length > 0 && (
+                <details className="border border-green-100 rounded-lg overflow-hidden" open>
+                  <summary className="bg-green-50 px-4 py-2.5 text-xs font-semibold text-green-800 cursor-pointer">
+                    {newRows.length} new user{newRows.length !== 1 ? "s" : ""} to create
+                  </summary>
+                  <div className="divide-y divide-gray-100 max-h-40 overflow-y-auto">
+                    {newRows.map((r) => (
+                      <div key={r.rowNumber} className="px-4 py-2 text-xs">
+                        <span className="font-medium text-gray-800">{r.data.name || r.data.email.split("@")[0]}</span>
+                        <span className="text-gray-400"> · {r.data.email} · {r.data.account_type || "guardian"} · {r.data.plates.join(", ")}</span>
+                      </div>
+                    ))}
+                  </div>
+                </details>
+              )}
+
+              {/* Skipped rows */}
+              {skippedRows.length > 0 && (
+                <details className="border border-gray-200 rounded-lg overflow-hidden">
+                  <summary className="bg-gray-50 px-4 py-2.5 text-xs font-semibold text-gray-600 cursor-pointer">
+                    {skippedRows.length} row{skippedRows.length !== 1 ? "s" : ""} skipped
+                  </summary>
+                  <div className="divide-y divide-gray-100 max-h-40 overflow-y-auto">
+                    {skippedRows.map((r) => (
+                      <div key={r.rowNumber} className="px-4 py-2 text-xs">
+                        <span className="text-gray-500">Row {r.rowNumber + 1}: </span>
+                        <span className="text-red-500">{r.reason}</span>
+                        {r.data.email && <span className="text-gray-400"> ({r.data.email})</span>}
+                      </div>
+                    ))}
+                  </div>
+                </details>
+              )}
+
+              {parseError && (
+                <p className="text-sm text-red-600 bg-red-50 px-3 py-2 rounded-lg">{parseError}</p>
+              )}
+            </div>
+          )}
+
+          {/* ── Result phase ── */}
+          {phase === "result" && result && (
+            <div className="text-center py-6">
+              <div className="flex items-center justify-center w-12 h-12 rounded-full bg-green-100 mx-auto mb-4">
+                <svg className="w-6 h-6 text-green-600" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth={2}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
+                </svg>
+              </div>
+              <h3 className="text-lg font-bold text-gray-900 mb-1">Import complete</h3>
+              <p className="text-sm text-gray-500">
+                {result.created} created · {result.updated} updated · {result.skipped} skipped
+              </p>
+            </div>
+          )}
+        </div>
+
+        {/* Footer */}
+        <div className="flex items-center justify-end gap-3 px-6 py-4 border-t border-gray-100 bg-gray-50">
+          {phase === "preview" && (
+            <>
+              <button onClick={onClose} className="px-4 py-2 text-sm font-medium text-gray-600 hover:text-gray-800 transition">
+                Cancel
+              </button>
+              <button
+                onClick={runImport}
+                disabled={importing || importCount === 0}
+                className="flex items-center gap-2 px-5 py-2 text-sm font-medium bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50 transition"
+              >
+                {importing && (
+                  <span className="w-3.5 h-3.5 border-2 border-white border-t-transparent rounded-full animate-spin" />
+                )}
+                Import {importCount} user{importCount !== 1 ? "s" : ""}
+              </button>
+            </>
+          )}
+          {phase === "result" && (
+            <button
+              onClick={onClose}
+              className="px-5 py-2 text-sm font-medium bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition"
+            >
+              Done
+            </button>
+          )}
+          {phase === "upload" && (
+            <button onClick={onClose} className="px-4 py-2 text-sm font-medium text-gray-600 hover:text-gray-800 transition">
+              Cancel
+            </button>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ─── Main Page ──────────────────────────────────────────────────────────────
 
 function UserManagementContent() {
@@ -389,6 +926,7 @@ function UserManagementContent() {
   const [editTarget, setEditTarget] = useState<AppUser | null>(null);
   const [showAdd, setShowAdd] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<AppUser | null>(null);
+  const [showImport, setShowImport] = useState(false);
 
   useEffect(() => {
     if (!loading && (!user || !isAdmin)) router.push("/login");
@@ -524,6 +1062,33 @@ function UserManagementContent() {
     await deleteDoc(doc(db, "users", u.id));
   };
 
+  const handleImport = async (rows: PartitionedRow[]): Promise<ImportResult> => {
+    if (!db) throw new Error("Firebase not initialized");
+    const database = db;
+    let created = 0;
+    let updated = 0;
+
+    // Batch, chunked at 400 ops per commit.
+    for (let i = 0; i < rows.length; i += 400) {
+      const chunk = rows.slice(i, i + 400);
+      const batch = writeBatch(database);
+      for (const row of chunk) {
+        if (row.tag === "new") {
+          const ref = doc(collection(database, "users"));
+          batch.set(ref, { ...newUserPayload(row.data), createdAt: serverTimestamp() });
+          created++;
+        } else if (row.tag === "existing" && row.existingUser) {
+          const ref = doc(database, "users", row.existingUser.id);
+          batch.update(ref, updateUserPayload(row.data, row.existingUser));
+          updated++;
+        }
+      }
+      await batch.commit();
+    }
+
+    return { created, updated, skipped: 0 };
+  };
+
   if (loading) {
     return (
       <div className="min-h-screen flex items-center justify-center bg-gray-50">
@@ -548,15 +1113,26 @@ function UserManagementContent() {
               View, add, edit and remove guardians and students
             </p>
           </div>
-          <button
-            onClick={() => setShowAdd(true)}
-            className="flex items-center gap-2 px-5 py-2.5 bg-blue-600 text-white text-sm font-semibold rounded-xl hover:bg-blue-700 transition shadow-sm"
-          >
-            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth={2.5}>
-              <path strokeLinecap="round" strokeLinejoin="round" d="M12 4v16m8-8H4" />
-            </svg>
-            Add User
-          </button>
+          <div className="flex items-center gap-2.5">
+            <button
+              onClick={() => setShowImport(true)}
+              className="flex items-center gap-2 px-5 py-2.5 bg-white border border-gray-200 text-gray-700 text-sm font-semibold rounded-xl hover:bg-gray-50 transition shadow-sm"
+            >
+              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth={2}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5M16.5 12L12 16.5m0 0L7.5 12m4.5 4.5V3" />
+              </svg>
+              Import CSV
+            </button>
+            <button
+              onClick={() => setShowAdd(true)}
+              className="flex items-center gap-2 px-5 py-2.5 bg-blue-600 text-white text-sm font-semibold rounded-xl hover:bg-blue-700 transition shadow-sm"
+            >
+              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth={2.5}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M12 4v16m8-8H4" />
+              </svg>
+              Add User
+            </button>
+          </div>
         </div>
 
         {/* Stats */}
@@ -851,6 +1427,14 @@ function UserManagementContent() {
           userName={deleteTarget.name}
           onConfirm={() => handleDelete(deleteTarget)}
           onClose={() => setDeleteTarget(null)}
+        />
+      )}
+
+      {showImport && (
+        <ImportModal
+          existingUsers={allUsers}
+          onImport={handleImport}
+          onClose={() => setShowImport(false)}
         />
       )}
     </div>
