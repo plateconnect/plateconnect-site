@@ -146,6 +146,9 @@ const PERSON_TYPE_OPTIONS = [
   { value: "unknown", label: "Unknown" },
 ];
 
+const PAGE_SIZE_OPTIONS = [10, 20, 50, 100, 200];
+const DEFAULT_PAGE_SIZE = 50;
+
 const LOCATION_OPTIONS = [
   { value: "main entrance", label: "Main Entrance" },
   { value: "side entrance", label: "Side Entrance" },
@@ -267,6 +270,59 @@ function StampCell({ date }: { date: Date }) {
   );
 }
 
+/**
+ * Page number box. Keeps a free-text draft while typing so the field can be
+ * cleared mid-edit, then commits on Enter or blur, clamped into range. An
+ * out-of-range or non-numeric entry reverts rather than jumping somewhere odd.
+ */
+function PageJump({
+  page,
+  totalPages,
+  onJump,
+}: {
+  page: number;
+  totalPages: number;
+  onJump: (next: number) => void;
+}) {
+  const [draft, setDraft] = useState(String(page));
+
+  useEffect(() => {
+    setDraft(String(page));
+  }, [page]);
+
+  const commit = () => {
+    const parsed = Number.parseInt(draft, 10);
+    if (!Number.isFinite(parsed)) {
+      setDraft(String(page));
+      return;
+    }
+    const clamped = Math.min(totalPages, Math.max(1, parsed));
+    setDraft(String(clamped));
+    if (clamped !== page) onJump(clamped);
+  };
+
+  return (
+    <span className="flex items-center gap-1.5 px-1 text-xs text-gray-500">
+      <input
+        type="text"
+        inputMode="numeric"
+        value={draft}
+        onChange={(e) => setDraft(e.target.value.replace(/[^0-9]/g, ""))}
+        onBlur={commit}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") {
+            commit();
+            e.currentTarget.blur();
+          }
+        }}
+        aria-label={`Page number, 1 to ${totalPages}`}
+        className="w-12 px-2 py-1 text-center text-xs text-gray-700 border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+      />
+      <span className="whitespace-nowrap">/ {totalPages}</span>
+    </span>
+  );
+}
+
 function MultiSelectPills({
   label,
   options,
@@ -313,7 +369,7 @@ export default function AdminDashboardPage() {
   const [now, setNow] = useState(() => new Date());
   const [filtersOpen, setFiltersOpen] = useState(false);
 
-  const PAGE_SIZE = 50;
+  const [pageSize, setPageSize] = useState(DEFAULT_PAGE_SIZE);
   const [currentPage, setCurrentPage] = useState(1);
 
   const [startDate, setStartDate] = useState("");
@@ -432,12 +488,17 @@ export default function AdminDashboardPage() {
     return filtered;
   }, [groupedNotices, searchQuery, startDate, endDate, startTime, endTime, selectedLocations, selectedPersonTypes, statusFilter]);
 
-  const totalPages = Math.max(1, Math.ceil(filteredNotices.length / PAGE_SIZE));
-  const pagedNotices = filteredNotices.slice((currentPage - 1) * PAGE_SIZE, currentPage * PAGE_SIZE);
+  const totalPages = Math.max(1, Math.ceil(filteredNotices.length / pageSize));
+  const pagedNotices = filteredNotices.slice((currentPage - 1) * pageSize, currentPage * pageSize);
 
   useEffect(() => {
     setCurrentPage(1);
-  }, [searchQuery, startDate, endDate, startTime, endTime, selectedLocations, selectedPersonTypes, statusFilter]);
+  }, [searchQuery, startDate, endDate, startTime, endTime, selectedLocations, selectedPersonTypes, statusFilter, pageSize]);
+
+  // Filters can shrink the result set under the current page — follow it back in range.
+  useEffect(() => {
+    setCurrentPage((p) => Math.min(p, totalPages));
+  }, [totalPages]);
 
   const activeFilterCount = [
     startDate || endDate,
@@ -456,6 +517,7 @@ export default function AdminDashboardPage() {
     setStatusFilter("all");
     setSearchQuery("");
     setGroupPairs(true);
+    setPageSize(DEFAULT_PAGE_SIZE);
   };
 
   const getExportRows = (scope: ExportScope) => {
@@ -645,22 +707,42 @@ export default function AdminDashboardPage() {
                   <MultiSelectPills label="Detection Location" options={LOCATION_OPTIONS} selected={selectedLocations} onChange={setSelectedLocations} />
                 </div>
                 <div className="border-t border-gray-100 my-4" />
-                <div>
-                  <label className="block text-xs font-medium text-gray-500 mb-2">Display</label>
-                  <label className="inline-flex items-start gap-2.5 cursor-pointer select-none">
-                    <input
-                      type="checkbox"
-                      checked={groupPairs}
-                      onChange={(e) => setGroupPairs(e.target.checked)}
-                      className="mt-0.5 h-4 w-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
-                    />
-                    <span>
-                      <span className="block text-sm font-medium text-gray-900">Group</span>
-                      <span className="block text-xs text-gray-500">
-                        Stack each matched departure over its arrival in one combined row, with elapsed time.
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
+                  <div>
+                    <label className="block text-xs font-medium text-gray-500 mb-2">Display</label>
+                    <label className="inline-flex items-start gap-2.5 cursor-pointer select-none">
+                      <input
+                        type="checkbox"
+                        checked={groupPairs}
+                        onChange={(e) => setGroupPairs(e.target.checked)}
+                        className="mt-0.5 h-4 w-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                      />
+                      <span>
+                        <span className="block text-sm font-medium text-gray-900">Group</span>
+                        <span className="block text-xs text-gray-500">
+                          Stack each matched departure over its arrival in one combined row, with elapsed time.
+                        </span>
                       </span>
-                    </span>
-                  </label>
+                    </label>
+                  </div>
+                  <div>
+                    <label className="block text-xs font-medium text-gray-500 mb-2">Notices per page</label>
+                    <div className="flex gap-1.5">
+                      {PAGE_SIZE_OPTIONS.map((size) => (
+                        <button
+                          key={size}
+                          onClick={() => setPageSize(size)}
+                          className={`flex-1 px-2 py-2 text-xs font-medium rounded-lg border transition ${
+                            pageSize === size
+                              ? "bg-gray-900 border-gray-900 text-white"
+                              : "bg-white border-gray-200 text-gray-500 hover:bg-gray-50"
+                          }`}
+                        >
+                          {size}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
                 </div>
                 {activeFilterCount > 0 && (
                   <div className="mt-4 flex justify-end">
@@ -805,14 +887,14 @@ export default function AdminDashboardPage() {
               </div>
             )}
 
-            {filteredNotices.length > PAGE_SIZE && (
+            {filteredNotices.length > pageSize && (
               <div className="px-4 py-2.5 border-t border-gray-100 flex items-center justify-between">
                 <span className="text-xs text-gray-400">
-                  {(currentPage - 1) * PAGE_SIZE + 1}–{Math.min(currentPage * PAGE_SIZE, filteredNotices.length)} of {filteredNotices.length}
+                  {(currentPage - 1) * pageSize + 1}–{Math.min(currentPage * pageSize, filteredNotices.length)} of {filteredNotices.length}
                 </span>
                 <div className="flex items-center gap-1">
                   <button onClick={() => setCurrentPage((p) => Math.max(1, p - 1))} disabled={currentPage === 1} className="px-3 py-1.5 rounded-lg text-xs font-medium text-gray-600 hover:bg-gray-100 disabled:opacity-30 disabled:cursor-not-allowed transition">Previous</button>
-                  <span className="px-3 py-1.5 text-xs text-gray-500">{currentPage} / {totalPages}</span>
+                  <PageJump page={currentPage} totalPages={totalPages} onJump={setCurrentPage} />
                   <button onClick={() => setCurrentPage((p) => Math.min(totalPages, p + 1))} disabled={currentPage === totalPages} className="px-3 py-1.5 rounded-lg text-xs font-medium text-gray-600 hover:bg-gray-100 disabled:opacity-30 disabled:cursor-not-allowed transition">Next</button>
                 </div>
               </div>
