@@ -12,6 +12,15 @@ import {
   Timestamp,
 } from "firebase/firestore";
 import Sidebar from "@/components/Sidebar";
+import {
+  APP_TIME_ZONE,
+  zonedDayKey,
+  zonedTimeKey,
+  currentWeekStartKey,
+  formatDateShort,
+  formatTimeShort,
+  formatElapsed,
+} from "@/lib/appTime";
 
 interface Notice {
   id: string;
@@ -25,6 +34,8 @@ interface Notice {
   entrance_location?: string;
   status?: string;
   departure_time?: Timestamp;
+  departure_location?: string;
+  departure_image_url?: string;
 }
 
 function groupArrivals(raw: Notice[]): Notice[] {
@@ -36,7 +47,7 @@ function groupArrivals(raw: Notice[]): Notice[] {
       passthrough.push(n);
       continue;
     }
-    const day = n.arrival_time.toDate().toISOString().split("T")[0];
+    const day = zonedDayKey(n.arrival_time.toDate());
     const key = `${n.license_plate.toLowerCase()}_${day}`;
     if (!byKey.has(key)) byKey.set(key, []);
     byKey.get(key)!.push(n);
@@ -51,7 +62,13 @@ function groupArrivals(raw: Notice[]): Notice[] {
       const status = (n.status || "").toLowerCase();
       if (status === "left" && pendingArrivals.length > 0) {
         const arrived = pendingArrivals.shift()!;
-        result.push({ ...arrived, status: "left", departure_time: n.arrival_time });
+        result.push({
+          ...arrived,
+          status: "left",
+          departure_time: n.arrival_time,
+          departure_location: n.entrance_location,
+          departure_image_url: n.image_url,
+        });
       } else if (status === "arrived") {
         pendingArrivals.push(n);
       } else {
@@ -64,23 +81,6 @@ function groupArrivals(raw: Notice[]): Notice[] {
   return result.sort((a, b) => b.arrival_time.toMillis() - a.arrival_time.toMillis());
 }
 
-function formatDateShort(d: Date) {
-  return `${d.getMonth() + 1}/${String(d.getDate()).padStart(2, "0")}/${String(d.getFullYear()).slice(-2)}`;
-}
-
-function formatTimeShort(d: Date) {
-  return d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
-}
-
-function formatElapsed(startMs: number, endMs: number) {
-  const totalMin = Math.max(0, Math.round((endMs - startMs) / 60000));
-  const h = Math.floor(totalMin / 60);
-  const m = totalMin % 60;
-  if (h === 0) return `${m}m`;
-  if (m === 0) return `${h}h`;
-  return `${h}h ${m}m`;
-}
-
 type ExportScope = "current-filter" | "today" | "this-week" | "all";
 
 function statusLabel(status?: string) {
@@ -91,18 +91,38 @@ function statusLabel(status?: string) {
 }
 
 function exportToCsv(rows: Notice[], scope: ExportScope) {
-  const headers = ["Type", "Name", "License Plate", "Location", "Status", "Image URL", "Date", "Time"];
+  const headers = [
+    "Type",
+    "Name",
+    "License Plate",
+    "Status",
+    "Arrival Date",
+    "Arrival Time",
+    "Arrival Location",
+    "Arrival Image URL",
+    "Departure Date",
+    "Departure Time",
+    "Departure Location",
+    "Departure Image URL",
+    "Elapsed",
+  ];
   const lines = rows.map((n) => {
-    const d = n.arrival_time.toDate();
+    const arrival = n.arrival_time.toDate();
+    const departure = n.departure_time?.toDate();
     return [
       n.person_type ?? "unknown",
       n.ward_names.join(", "),
       n.license_plate ?? "",
-      n.entrance_location ?? "",
       statusLabel(n.status),
+      arrival.toLocaleDateString([], { timeZone: APP_TIME_ZONE }),
+      arrival.toLocaleTimeString([], { timeZone: APP_TIME_ZONE }),
+      n.entrance_location ?? "",
       n.image_url ?? "",
-      d.toLocaleDateString(),
-      d.toLocaleTimeString(),
+      departure ? departure.toLocaleDateString([], { timeZone: APP_TIME_ZONE }) : "",
+      departure ? departure.toLocaleTimeString([], { timeZone: APP_TIME_ZONE }) : "",
+      departure ? n.departure_location ?? "" : "",
+      departure ? n.departure_image_url ?? "" : "",
+      departure ? formatElapsed(arrival.getTime(), departure.getTime()) : "",
     ]
       .map((v) => `"${String(v).replace(/"/g, '""')}"`)
       .join(",");
@@ -113,7 +133,7 @@ function exportToCsv(rows: Notice[], scope: ExportScope) {
   const a = document.createElement("a");
   a.href = url;
   const scopeLabel = scope === "current-filter" ? "current-filter" : scope === "today" ? "today" : scope === "this-week" ? "this-week" : "all";
-  a.download = `notices-${scopeLabel}-${new Date().toISOString().split("T")[0]}.csv`;
+  a.download = `notices-${scopeLabel}-${zonedDayKey(new Date())}.csv`;
   a.click();
   URL.revokeObjectURL(url);
 }
@@ -210,6 +230,43 @@ function TimeRangeCell({ arrival, departure }: { arrival: Date; departure?: Date
   );
 }
 
+/* Grouped-view cell classes: the whole entry highlights as one block on hover,
+   ENTRY_EDGE closes an entry, INNER_EDGE separates left/arrived within one. */
+const CELL = "px-3 transition-colors group-hover/entry:bg-gray-50";
+const ENTRY_EDGE = "border-b border-gray-100";
+const INNER_EDGE = "border-b border-gray-50";
+
+function PlateCell({ plate }: { plate?: string }) {
+  if (!plate) return <span className="text-xs text-gray-300">—</span>;
+  return (
+    <span className="font-mono text-xs font-bold bg-gray-100 px-2.5 py-1 rounded tracking-wide">
+      {plate}
+    </span>
+  );
+}
+
+function LocationCell({ location }: { location?: string }) {
+  if (!location) return <span className="text-xs text-gray-300">—</span>;
+  return <span className="text-xs text-gray-600">{location}</span>;
+}
+
+function ImageCell({ url }: { url?: string }) {
+  if (!url) return <span className="text-xs text-gray-300">—</span>;
+  return (
+    <a href={url} target="_blank" rel="noopener noreferrer" className="text-sm text-blue-600 hover:text-blue-700 hover:underline">
+      View image
+    </a>
+  );
+}
+
+function StampCell({ date }: { date: Date }) {
+  return (
+    <span className="text-sm text-gray-900 whitespace-nowrap">
+      {formatDateShort(date)} {formatTimeShort(date)}
+    </span>
+  );
+}
+
 function MultiSelectPills({
   label,
   options,
@@ -267,6 +324,7 @@ export default function AdminDashboardPage() {
   const [statusFilter, setStatusFilter] = useState<string>("all");
   const [selectedLocations, setSelectedLocations] = useState<string[]>([]);
   const [selectedPersonTypes, setSelectedPersonTypes] = useState<string[]>([]);
+  const [groupPairs, setGroupPairs] = useState(true);
   const [exportModalOpen, setExportModalOpen] = useState(false);
   const [exportScope, setExportScope] = useState<ExportScope>("current-filter");
 
@@ -308,14 +366,10 @@ export default function AdminDashboardPage() {
   const groupedNotices = useMemo(() => groupArrivals(notices), [notices]);
 
   const stats = useMemo(() => {
-    const todayStart = new Date();
-    todayStart.setHours(0, 0, 0, 0);
-    const todayMs = todayStart.getTime();
-    const today = groupedNotices.filter((n) => n.arrival_time.toMillis() >= todayMs);
-    const weekStart = new Date();
-    weekStart.setDate(weekStart.getDate() - weekStart.getDay());
-    weekStart.setHours(0, 0, 0, 0);
-    const thisWeek = groupedNotices.filter((n) => n.arrival_time.toMillis() >= weekStart.getTime());
+    const todayKey = zonedDayKey(new Date());
+    const weekStartKey = currentWeekStartKey();
+    const today = groupedNotices.filter((n) => zonedDayKey(n.arrival_time.toDate()) === todayKey);
+    const thisWeek = groupedNotices.filter((n) => zonedDayKey(n.arrival_time.toDate()) >= weekStartKey);
     return {
       todayTotal: today.length,
       todayArrived: today.filter((n) => (n.status || "").toLowerCase() === "arrived").length,
@@ -345,7 +399,7 @@ export default function AdminDashboardPage() {
     }
     if (startDate || endDate) {
       filtered = filtered.filter((n) => {
-        const d = n.arrival_time.toDate().toISOString().split("T")[0];
+        const d = zonedDayKey(n.arrival_time.toDate());
         if (startDate && d < startDate) return false;
         if (endDate && d > endDate) return false;
         return true;
@@ -353,8 +407,7 @@ export default function AdminDashboardPage() {
     }
     if (startTime || endTime) {
       filtered = filtered.filter((n) => {
-        const d = n.arrival_time.toDate();
-        const t = `${d.getHours().toString().padStart(2, "0")}:${d.getMinutes().toString().padStart(2, "0")}`;
+        const t = zonedTimeKey(n.arrival_time.toDate());
         if (startTime && t < startTime) return false;
         if (endTime && t > endTime) return false;
         return true;
@@ -392,6 +445,7 @@ export default function AdminDashboardPage() {
     selectedLocations.length > 0,
     selectedPersonTypes.length > 0,
     statusFilter !== "all",
+    !groupPairs,
   ].filter(Boolean).length;
 
   const resetFilters = () => {
@@ -401,23 +455,20 @@ export default function AdminDashboardPage() {
     setSelectedPersonTypes([]);
     setStatusFilter("all");
     setSearchQuery("");
+    setGroupPairs(true);
   };
 
   const getExportRows = (scope: ExportScope) => {
     if (scope === "current-filter") return filteredNotices;
 
-    const todayStart = new Date();
-    todayStart.setHours(0, 0, 0, 0);
-
     if (scope === "today") {
-      return groupedNotices.filter((n) => n.arrival_time.toMillis() >= todayStart.getTime());
+      const todayKey = zonedDayKey(new Date());
+      return groupedNotices.filter((n) => zonedDayKey(n.arrival_time.toDate()) === todayKey);
     }
 
-    const weekStart = new Date(todayStart);
-    weekStart.setDate(weekStart.getDate() - weekStart.getDay());
-
     if (scope === "this-week") {
-      return groupedNotices.filter((n) => n.arrival_time.toMillis() >= weekStart.getTime());
+      const weekStartKey = currentWeekStartKey();
+      return groupedNotices.filter((n) => zonedDayKey(n.arrival_time.toDate()) >= weekStartKey);
     }
 
     return groupedNotices;
@@ -593,6 +644,24 @@ export default function AdminDashboardPage() {
                   <MultiSelectPills label="Person Type" options={PERSON_TYPE_OPTIONS} selected={selectedPersonTypes} onChange={setSelectedPersonTypes} />
                   <MultiSelectPills label="Detection Location" options={LOCATION_OPTIONS} selected={selectedLocations} onChange={setSelectedLocations} />
                 </div>
+                <div className="border-t border-gray-100 my-4" />
+                <div>
+                  <label className="block text-xs font-medium text-gray-500 mb-2">Display</label>
+                  <label className="inline-flex items-start gap-2.5 cursor-pointer select-none">
+                    <input
+                      type="checkbox"
+                      checked={groupPairs}
+                      onChange={(e) => setGroupPairs(e.target.checked)}
+                      className="mt-0.5 h-4 w-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                    />
+                    <span>
+                      <span className="block text-sm font-medium text-gray-900">Group</span>
+                      <span className="block text-xs text-gray-500">
+                        Stack each matched departure over its arrival in one combined row, with elapsed time.
+                      </span>
+                    </span>
+                  </label>
+                </div>
                 {activeFilterCount > 0 && (
                   <div className="mt-4 flex justify-end">
                     <button onClick={resetFilters} className="text-xs text-gray-500 hover:text-gray-700 transition">Clear all filters</button>
@@ -610,60 +679,117 @@ export default function AdminDashboardPage() {
                   <tr className="border-b border-gray-200 bg-gray-50">
                     <th className="px-3 py-2.5 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">Status</th>
                     <th className="px-3 py-2.5 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">Type</th>
-                    <th className="px-3 py-2.5 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider whitespace-nowrap">Time</th>
-                    <th className="px-3 py-2.5 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider whitespace-nowrap">License Plate</th>
                     <th className="px-3 py-2.5 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">Name</th>
+                    <th className="px-3 py-2.5 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider whitespace-nowrap">Time</th>
+                    {groupPairs && (
+                      <th className="px-3 py-2.5 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider whitespace-nowrap">Elapsed</th>
+                    )}
+                    <th className="px-3 py-2.5 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider whitespace-nowrap">License Plate</th>
                     <th className="px-3 py-2.5 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">Location</th>
                     <th className="px-3 py-2.5 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">Image</th>
                   </tr>
                 </thead>
-                <tbody className="divide-y divide-gray-50">
-                  {pagedNotices.map((notice) => {
+                {groupPairs ? (
+                  pagedNotices.map((notice, idx) => {
                     const arrivalDate = notice.arrival_time.toDate();
                     const departureDate = notice.departure_time?.toDate();
+                    const edge = idx === pagedNotices.length - 1 ? "" : ENTRY_EDGE;
+
+                    if (!departureDate) {
+                      return (
+                        <tbody key={notice.id} className="group/entry">
+                          <tr>
+                            <td className={`${CELL} py-2.5 ${edge}`}><StatusBadge status={notice.status} /></td>
+                            <td className={`${CELL} py-2.5 ${edge}`}><PersonTypeBadge type={notice.person_type} /></td>
+                            <td className={`${CELL} py-2.5 ${edge}`}>
+                              <span className="text-sm font-medium text-gray-900">{notice.ward_names.join(", ")}</span>
+                            </td>
+                            <td className={`${CELL} py-2.5 whitespace-nowrap ${edge}`}><StampCell date={arrivalDate} /></td>
+                            <td className={`${CELL} py-2.5 ${edge}`}><span className="text-xs text-gray-300">—</span></td>
+                            <td className={`${CELL} py-2.5 ${edge}`}><PlateCell plate={notice.license_plate} /></td>
+                            <td className={`${CELL} py-2.5 ${edge}`}><LocationCell location={notice.entrance_location} /></td>
+                            <td className={`${CELL} py-2.5 ${edge}`}><ImageCell url={notice.image_url} /></td>
+                          </tr>
+                        </tbody>
+                      );
+                    }
+
                     return (
-                      <tr key={notice.id} className="hover:bg-gray-50 transition-colors">
-                        <td className="px-3 py-2.5">
-                          <StatusBadge status={notice.status} />
-                        </td>
-                        <td className="px-3 py-2.5">
-                          <PersonTypeBadge type={notice.person_type} />
-                        </td>
-                        <td className="px-3 py-2.5 whitespace-nowrap">
-                          <TimeRangeCell arrival={arrivalDate} departure={departureDate} />
-                        </td>
-                        <td className="px-3 py-2.5">
-                          {notice.license_plate ? (
-                            <span className="font-mono text-xs font-bold bg-gray-100 px-2.5 py-1 rounded tracking-wide">
-                              {notice.license_plate}
+                      <tbody key={notice.id} className="group/entry">
+                        {/* Left (departure) — top half of the combined row */}
+                        <tr>
+                          <td className={`${CELL} pt-3 pb-1.5 ${INNER_EDGE}`}><StatusBadge status="left" /></td>
+                          <td rowSpan={2} className={`${CELL} py-2.5 align-middle ${edge}`}>
+                            <PersonTypeBadge type={notice.person_type} />
+                          </td>
+                          <td rowSpan={2} className={`${CELL} py-2.5 align-middle ${edge}`}>
+                            <span className="text-sm font-medium text-gray-900">{notice.ward_names.join(", ")}</span>
+                          </td>
+                          <td className={`${CELL} pt-3 pb-1.5 whitespace-nowrap ${INNER_EDGE}`}>
+                            <StampCell date={departureDate} />
+                          </td>
+                          <td rowSpan={2} className={`${CELL} py-2.5 align-middle ${edge}`}>
+                            <span className="text-sm font-semibold text-gray-700 whitespace-nowrap">
+                              {formatElapsed(arrivalDate.getTime(), departureDate.getTime())}
                             </span>
-                          ) : (
-                            <span className="text-xs text-gray-300">—</span>
-                          )}
-                        </td>
-                        <td className="px-3 py-2.5">
-                          <span className="text-sm font-medium text-gray-900">{notice.ward_names.join(", ")}</span>
-                        </td>
-                        <td className="px-3 py-2.5">
-                          {notice.entrance_location ? (
-                            <span className="text-xs text-gray-600">{notice.entrance_location}</span>
-                          ) : (
-                            <span className="text-xs text-gray-300">—</span>
-                          )}
-                        </td>
-                        <td className="px-3 py-2.5">
-                          {notice.image_url ? (
-                            <a href={notice.image_url} target="_blank" rel="noopener noreferrer" className="text-sm text-blue-600 hover:text-blue-700 hover:underline">
-                              View image
-                            </a>
-                          ) : (
-                            <span className="text-xs text-gray-300">—</span>
-                          )}
-                        </td>
-                      </tr>
+                          </td>
+                          <td rowSpan={2} className={`${CELL} py-2.5 align-middle ${edge}`}>
+                            <PlateCell plate={notice.license_plate} />
+                          </td>
+                          <td className={`${CELL} pt-3 pb-1.5 ${INNER_EDGE}`}>
+                            <LocationCell location={notice.departure_location} />
+                          </td>
+                          <td className={`${CELL} pt-3 pb-1.5 ${INNER_EDGE}`}>
+                            <ImageCell url={notice.departure_image_url} />
+                          </td>
+                        </tr>
+                        {/* Arrived — bottom half of the combined row */}
+                        <tr>
+                          <td className={`${CELL} pt-1.5 pb-3 ${edge}`}><StatusBadge status="arrived" /></td>
+                          <td className={`${CELL} pt-1.5 pb-3 whitespace-nowrap ${edge}`}>
+                            <StampCell date={arrivalDate} />
+                          </td>
+                          <td className={`${CELL} pt-1.5 pb-3 ${edge}`}>
+                            <LocationCell location={notice.entrance_location} />
+                          </td>
+                          <td className={`${CELL} pt-1.5 pb-3 ${edge}`}><ImageCell url={notice.image_url} /></td>
+                        </tr>
+                      </tbody>
                     );
-                  })}
-                </tbody>
+                  })
+                ) : (
+                  <tbody className="divide-y divide-gray-50">
+                    {pagedNotices.map((notice) => {
+                      const arrivalDate = notice.arrival_time.toDate();
+                      const departureDate = notice.departure_time?.toDate();
+                      return (
+                        <tr key={notice.id} className="hover:bg-gray-50 transition-colors">
+                          <td className="px-3 py-2.5">
+                            <StatusBadge status={notice.status} />
+                          </td>
+                          <td className="px-3 py-2.5">
+                            <PersonTypeBadge type={notice.person_type} />
+                          </td>
+                          <td className="px-3 py-2.5">
+                            <span className="text-sm font-medium text-gray-900">{notice.ward_names.join(", ")}</span>
+                          </td>
+                          <td className="px-3 py-2.5 whitespace-nowrap">
+                            <TimeRangeCell arrival={arrivalDate} departure={departureDate} />
+                          </td>
+                          <td className="px-3 py-2.5">
+                            <PlateCell plate={notice.license_plate} />
+                          </td>
+                          <td className="px-3 py-2.5">
+                            <LocationCell location={notice.entrance_location} />
+                          </td>
+                          <td className="px-3 py-2.5">
+                            <ImageCell url={notice.image_url} />
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                )}
               </table>
             </div>
 
