@@ -10,8 +10,8 @@ import {
   orderBy,
   onSnapshot,
   Timestamp,
-  where,
   limit,
+  getCountFromServer,
 } from "firebase/firestore";
 import Sidebar from "@/components/Sidebar";
 import {
@@ -24,11 +24,11 @@ import {
   formatElapsed,
 } from "@/lib/appTime";
 
-// How much of the arrivals log this page loads. `arrivals` is append-only and
-// grows by roughly 700 documents a day, so an unbounded read here gets steadily
-// more expensive forever. These two bounds keep a page load flat.
-const ARRIVALS_WINDOW_DAYS = 7;
-const ARRIVALS_MAX_ROWS = 1000;
+// `arrivals` is append-only and grows ~990 documents a day, so reading all of
+// it on every page view gets steadily more expensive forever. Load a couple of
+// days by default and let the user pull more on demand.
+const ARRIVALS_INITIAL_ROWS = 2000;
+const ARRIVALS_PAGE_ROWS = 4000;
 
 interface Notice {
   id: string;
@@ -394,6 +394,11 @@ export default function AdminDashboardPage() {
   const [pageSize, setPageSize] = useState(DEFAULT_PAGE_SIZE);
   const [currentPage, setCurrentPage] = useState(1);
 
+  // How many arrival documents to pull. Raised by "Load older", so the cost of
+  // reading history is paid only when someone actually asks for it.
+  const [rowLimit, setRowLimit] = useState(ARRIVALS_INITIAL_ROWS);
+  const [totalArrivals, setTotalArrivals] = useState<number | null>(null);
+
   const [startDate, setStartDate] = useState("");
   const [endDate, setEndDate] = useState("");
   const [startTime, setStartTime] = useState("");
@@ -418,18 +423,16 @@ export default function AdminDashboardPage() {
   useEffect(() => {
     if (!user || !db) return;
     // Bounded on purpose. This used to be an unbounded onSnapshot over the
-    // whole `arrivals` collection, so every visit to this page read all 12,700+
-    // documents — and the cost grew with the log forever (~700 new arrivals a
-    // day). A date window plus a hard cap keeps each load roughly constant.
-    // Widen ARRIVALS_WINDOW_DAYS if you need more history in the table.
-    const since = Timestamp.fromMillis(
-      Date.now() - ARRIVALS_WINDOW_DAYS * 24 * 60 * 60 * 1000,
-    );
+    // whole `arrivals` collection, so every visit read all 12,700+ documents,
+    // and the cost grew with the log forever (~990 new arrivals a day).
+    //
+    // Paginated rather than fixed: a hard cap silently hid older rows, which
+    // looked like data loss. The user now controls how far back to load, so
+    // history is always reachable and the reads are only spent when asked for.
     const q = query(
       collection(db, "arrivals"),
-      where("arrival_time", ">=", since),
       orderBy("arrival_time", "desc"),
-      limit(ARRIVALS_MAX_ROWS),
+      limit(rowLimit),
     );
     const unsubscribe = onSnapshot(q, (snapshot) => {
       const noticesData: Notice[] = [];
@@ -453,6 +456,24 @@ export default function AdminDashboardPage() {
       setLastSyncTime(new Date());
     });
     return () => unsubscribe();
+  }, [user, rowLimit]);
+
+  // Total document count, so "showing X of Y" is honest about what is hidden.
+  // A count aggregation bills ~1 read per 1000 matched documents, so this is a
+  // dozen reads rather than the 12,000 a full fetch would cost.
+  useEffect(() => {
+    if (!user || !db) return;
+    let cancelled = false;
+    getCountFromServer(collection(db, "arrivals"))
+      .then((snap) => {
+        if (!cancelled) setTotalArrivals(snap.data().count);
+      })
+      .catch(() => {
+        if (!cancelled) setTotalArrivals(null);
+      });
+    return () => {
+      cancelled = true;
+    };
   }, [user]);
 
   const groupedNotices = useMemo(() => groupArrivals(notices), [notices]);
@@ -541,6 +562,12 @@ export default function AdminDashboardPage() {
     else if (statusFilter === "not-set") filtered = filtered.filter((n) => !["arrived", "left"].includes((n.status || "").toLowerCase()));
     return filtered;
   }, [groupedNotices, searchQuery, startDate, endDate, startTime, endTime, selectedLocations, selectedPersonTypes, statusFilter]);
+
+  // Oldest arrival actually loaded, for the "back to ..." hint in the footer.
+  const oldestLoaded = useMemo(() => {
+    const last = notices[notices.length - 1];
+    return last?.arrival_time ? last.arrival_time.toDate() : null;
+  }, [notices]);
 
   const totalPages = Math.max(1, Math.ceil(filteredNotices.length / pageSize));
   const pagedNotices = filteredNotices.slice((currentPage - 1) * pageSize, currentPage * pageSize);
@@ -1001,6 +1028,25 @@ export default function AdminDashboardPage() {
                 </div>
               </div>
             )}
+
+            {/* How far back the table reaches. Stated explicitly so a bounded
+                load never looks like missing data. */}
+            <div className="px-4 py-3 border-t border-gray-100 flex flex-wrap items-center justify-between gap-2">
+              <span className="text-xs text-gray-400">
+                Loaded the {notices.length.toLocaleString()} most recent arrivals
+                {totalArrivals !== null && ` of ${totalArrivals.toLocaleString()}`}
+                {oldestLoaded && ` · back to ${formatDateShort(oldestLoaded)} ${formatTimeShort(oldestLoaded)}`}
+              </span>
+              {totalArrivals !== null && notices.length < totalArrivals && (
+                <button
+                  type="button"
+                  onClick={() => setRowLimit((n) => n + ARRIVALS_PAGE_ROWS)}
+                  className="px-3 py-1.5 rounded-lg text-xs font-medium text-blue-600 border border-blue-200 hover:bg-blue-50 transition"
+                >
+                  Load {Math.min(ARRIVALS_PAGE_ROWS, totalArrivals - notices.length).toLocaleString()} older
+                </button>
+              )}
+            </div>
           </div>
         </div>
       </div>
