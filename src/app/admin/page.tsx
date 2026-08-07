@@ -10,6 +10,8 @@ import {
   orderBy,
   onSnapshot,
   Timestamp,
+  where,
+  limit,
 } from "firebase/firestore";
 import Sidebar from "@/components/Sidebar";
 import {
@@ -22,6 +24,12 @@ import {
   formatElapsed,
 } from "@/lib/appTime";
 
+// How much of the arrivals log this page loads. `arrivals` is append-only and
+// grows by roughly 700 documents a day, so an unbounded read here gets steadily
+// more expensive forever. These two bounds keep a page load flat.
+const ARRIVALS_WINDOW_DAYS = 7;
+const ARRIVALS_MAX_ROWS = 1000;
+
 interface Notice {
   id: string;
   arrival_time: Timestamp;
@@ -31,11 +39,25 @@ interface Notice {
   image_url?: string;
   ward_ids?: string[];
   person_type?: string;
+  person_name?: string;
   entrance_location?: string;
   status?: string;
   departure_time?: Timestamp;
   departure_location?: string;
   departure_image_url?: string;
+}
+
+/**
+ * Who to show for an arrival.
+ *
+ * A guardian arrival is about the students being collected, so their names win.
+ * Faculty and staff have no wards, which is why those rows rendered blank —
+ * fall back to the matched person's own name. Both fields are denormalised onto
+ * the arrival by firebase_send.py at detection time, so this costs no reads.
+ */
+function displayName(n: Notice): string {
+  if (n.ward_names.length > 0) return n.ward_names.join(", ");
+  return n.person_name || "—";
 }
 
 function groupArrivals(raw: Notice[]): Notice[] {
@@ -111,7 +133,7 @@ function exportToCsv(rows: Notice[], scope: ExportScope) {
     const departure = n.departure_time?.toDate();
     return [
       n.person_type ?? "unknown",
-      n.ward_names.join(", "),
+      displayName(n),
       n.license_plate ?? "",
       statusLabel(n.status),
       arrival.toLocaleDateString([], { timeZone: APP_TIME_ZONE }),
@@ -395,7 +417,20 @@ export default function AdminDashboardPage() {
 
   useEffect(() => {
     if (!user || !db) return;
-    const q = query(collection(db, "arrivals"), orderBy("arrival_time", "desc"));
+    // Bounded on purpose. This used to be an unbounded onSnapshot over the
+    // whole `arrivals` collection, so every visit to this page read all 12,700+
+    // documents — and the cost grew with the log forever (~700 new arrivals a
+    // day). A date window plus a hard cap keeps each load roughly constant.
+    // Widen ARRIVALS_WINDOW_DAYS if you need more history in the table.
+    const since = Timestamp.fromMillis(
+      Date.now() - ARRIVALS_WINDOW_DAYS * 24 * 60 * 60 * 1000,
+    );
+    const q = query(
+      collection(db, "arrivals"),
+      where("arrival_time", ">=", since),
+      orderBy("arrival_time", "desc"),
+      limit(ARRIVALS_MAX_ROWS),
+    );
     const unsubscribe = onSnapshot(q, (snapshot) => {
       const noticesData: Notice[] = [];
       snapshot.forEach((doc) => {
@@ -409,6 +444,7 @@ export default function AdminDashboardPage() {
           image_url: data.image_url,
           ward_ids: data.ward_ids,
           person_type: data.person_type || "unknown",
+          person_name: data.person_name,
           entrance_location: data.entrance_location,
           status: data.status,
         });
@@ -450,6 +486,7 @@ export default function AdminDashboardPage() {
       filtered = filtered.filter(
         (n) =>
           n.ward_names.some((name) => name.toLowerCase().includes(q)) ||
+          (n.person_name && n.person_name.toLowerCase().includes(q)) ||
           (n.license_plate && n.license_plate.toLowerCase().includes(q))
       );
     }
@@ -615,7 +652,11 @@ export default function AdminDashboardPage() {
                 color: "text-gray-900",
               },
               {
-                label: "All Time", value: stats.allTime, icon: (
+                // Was "All Time". The table now loads a bounded window, and at
+                // ~900 arrivals/day the row cap is usually reached before the
+                // day window is, so this counts what is actually loaded rather
+                // than claiming a span it may not cover.
+                label: "Loaded", value: stats.allTime, icon: (
                   <svg className="w-4 h-4 text-gray-600" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M4 7v10c0 2.21 3.582 4 8 4s8-1.79 8-4V7M4 7c0 2.21 3.582 4 8 4s8-1.79 8-4M4 7c0-2.21 3.582-4 8-4s8 1.79 8 4" /></svg>
                 ), iconBg: "bg-gray-100",
                 sub: <div className="text-xs text-gray-400 mt-2">total records</div>,
@@ -784,7 +825,7 @@ export default function AdminDashboardPage() {
                             <td className={`${CELL} py-2.5 ${edge}`}><StatusBadge status={notice.status} /></td>
                             <td className={`${CELL} py-2.5 ${edge}`}><PersonTypeBadge type={notice.person_type} /></td>
                             <td className={`${CELL} py-2.5 ${edge}`}>
-                              <span className="text-sm font-medium text-gray-900">{notice.ward_names.join(", ")}</span>
+                              <span className="text-sm font-medium text-gray-900">{displayName(notice)}</span>
                             </td>
                             <td className={`${CELL} py-2.5 whitespace-nowrap ${edge}`}><StampCell date={arrivalDate} /></td>
                             <td className={`${CELL} py-2.5 ${edge}`}><span className="text-xs text-gray-300">—</span></td>
@@ -805,7 +846,7 @@ export default function AdminDashboardPage() {
                             <PersonTypeBadge type={notice.person_type} />
                           </td>
                           <td rowSpan={2} className={`${CELL} py-2.5 align-middle ${edge}`}>
-                            <span className="text-sm font-medium text-gray-900">{notice.ward_names.join(", ")}</span>
+                            <span className="text-sm font-medium text-gray-900">{displayName(notice)}</span>
                           </td>
                           <td className={`${CELL} pt-3 pb-1.5 whitespace-nowrap ${INNER_EDGE}`}>
                             <StampCell date={departureDate} />
@@ -853,7 +894,7 @@ export default function AdminDashboardPage() {
                             <PersonTypeBadge type={notice.person_type} />
                           </td>
                           <td className="px-3 py-2.5">
-                            <span className="text-sm font-medium text-gray-900">{notice.ward_names.join(", ")}</span>
+                            <span className="text-sm font-medium text-gray-900">{displayName(notice)}</span>
                           </td>
                           <td className="px-3 py-2.5 whitespace-nowrap">
                             <TimeRangeCell arrival={arrivalDate} departure={departureDate} />
