@@ -1,6 +1,7 @@
 import { initializeApp, getApps } from "firebase/app";
 import { getAuth, type Auth } from "firebase/auth";
 import { getFirestore, type Firestore } from "firebase/firestore";
+import { getFunctions, type Functions } from "firebase/functions";
 
 const firebaseConfig = {
   apiKey: process.env.NEXT_PUBLIC_FIREBASE_API_KEY,
@@ -13,12 +14,17 @@ const firebaseConfig = {
 
 let auth: Auth | undefined;
 let db: Firestore | undefined;
+let functions: Functions | undefined;
 
 if (firebaseConfig.apiKey) {
   const app =
     getApps().length === 0 ? initializeApp(firebaseConfig) : getApps()[0];
   auth = getAuth(app);
   db = getFirestore(app);
+  // Callables run privileged user-management server-side: creating users keyed
+  // by Auth UID, and archiving instead of deleting. Neither is possible from
+  // the client under the current security rules.
+  functions = getFunctions(app);
 }
 
-export { auth, db };
+export { auth, db, functions };

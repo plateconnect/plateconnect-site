@@ -3,18 +3,16 @@
 import { useState, useEffect, useMemo, Suspense } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { useAuth } from "@/context/AuthContext";
-import { db } from "@/lib/firebase";
+import { db, functions } from "@/lib/firebase";
 import {
   collection,
   onSnapshot,
   Timestamp,
   doc,
   updateDoc,
-  deleteDoc,
-  addDoc,
-  serverTimestamp,
   writeBatch,
 } from "firebase/firestore";
+import { httpsCallable } from "firebase/functions";
 import Sidebar from "@/components/Sidebar";
 import GradeBadge from "@/components/GradeBadge";
 
@@ -29,14 +27,38 @@ interface AppUser {
   fcmToken?: string;
   fcmTokenUpdatedAt?: Timestamp;
   onboardingComplete?: boolean;
+  status?: "active" | "archived";
 }
+
+// ─── Account types ──────────────────────────────────────────────────────────
+
+// The single source of truth for account_type, mirroring ROLES in
+// functions/user_admin.js. This field used to be free text, which is how a CSV
+// import introduced "facilty" alongside "faculty" with nothing to catch it.
+const ACCOUNT_TYPES = [
+  {value: "guardian", label: "Guardian"},
+  {value: "student", label: "Student"},
+  {value: "faculty", label: "Faculty"},
+  {value: "teacher", label: "Teacher"},
+  {value: "admin", label: "Admin (staff role)"},
+  {value: "staff", label: "Staff"},
+] as const;
+
+type AccountType = (typeof ACCOUNT_TYPES)[number]["value"];
+
+const isKnownAccountType = (v: string): v is AccountType =>
+  ACCOUNT_TYPES.some((t) => t.value === v);
+
+// Only guardians and students sign in; every other role is a vehicle
+// registration so the gate recognises the car.
+const LOGIN_ROLES: string[] = ["guardian", "student"];
 
 // ─── Edit / Add Modal ───────────────────────────────────────────────────────
 
 interface UserFormData {
   name: string;
   email: string;
-  account_type: "guardian" | "student";
+  account_type: string;
   grade: string;
   wardIds: string;         // comma-separated
   licensePlateNumbers: string; // comma-separated
@@ -57,7 +79,10 @@ function userToForm(u: AppUser): UserFormData {
   return {
     name: u.name,
     email: u.email ?? "",
-    account_type: u.account_type === "student" ? "student" : "guardian",
+    // Preserve whatever is stored, even an unrecognised value such as the
+    // "facilty" typo, so opening and saving a record cannot silently rewrite
+    // someone's role to "guardian".
+    account_type: u.account_type || "guardian",
     grade: u.grade != null ? String(u.grade) : "",
     wardIds: (u.wardIds ?? []).join(", "),
     licensePlateNumbers: (u.licensePlateNumbers ?? []).join(", "),
@@ -230,22 +255,9 @@ function partitionRows(
   return { partitioned, missingHeaders: [] };
 }
 
-// Field payload for a new user doc.
-function newUserPayload(data: ImportRow): Record<string, unknown> {
-  const account_type = data.account_type || "guardian";
-  const payload: Record<string, unknown> = {
-    name: data.name || data.email.split("@")[0],
-    email: data.email,
-    account_type,
-    licensePlateNumbers: data.plates,
-    onboardingComplete: false,
-  };
-  if (account_type === "student" && data.grade) {
-    const g = parseInt(data.grade, 10);
-    if (!Number.isNaN(g)) payload.grade = g;
-  }
-  return payload;
-}
+// New-user payloads are now built server-side by the createUserAccount
+// callable, which owns the Auth account and keys the document by its UID.
+// Building them here is what produced orphaned, random-id documents.
 
 // Merge payload for updating an existing user: replace plates; other fields
 // only when non-blank; never touch wardIds/onboardingComplete/fcmToken.
@@ -362,24 +374,35 @@ function UserModal({ mode, initial, allStudents, onSave, onClose }: UserModalPro
             <label className="block text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1.5">
               Account Type
             </label>
-            <div className="flex gap-2">
-              {(["guardian", "student"] as const).map((t) => (
-                <button
-                  key={t}
-                  type="button"
-                  onClick={() => set("account_type", t)}
-                  className={`flex-1 py-2.5 rounded-lg text-sm font-medium border transition capitalize ${
-                    form.account_type === t
-                      ? t === "guardian"
-                        ? "bg-blue-600 border-blue-600 text-white"
-                        : "bg-green-600 border-green-600 text-white"
-                      : "bg-white border-gray-200 text-gray-600 hover:bg-gray-50"
-                  }`}
-                >
-                  {t}
-                </button>
+            <select
+              value={form.account_type}
+              onChange={(e) => set("account_type", e.target.value)}
+              className="w-full px-3 py-2.5 text-sm border border-gray-200 rounded-lg bg-white focus:outline-none focus:ring-2 focus:ring-blue-500"
+            >
+              {ACCOUNT_TYPES.map((t) => (
+                <option key={t.value} value={t.value}>
+                  {t.label}
+                </option>
               ))}
-            </div>
+              {/* Keep an unrecognised stored value selectable so editing a
+                  record never silently changes someone's role. */}
+              {!isKnownAccountType(form.account_type) && (
+                <option value={form.account_type}>
+                  {form.account_type} (unrecognised)
+                </option>
+              )}
+            </select>
+            {!isKnownAccountType(form.account_type) && (
+              <p className="mt-1.5 text-xs text-amber-600">
+                &ldquo;{form.account_type}&rdquo; isn&apos;t a known account
+                type &mdash; likely a typo. Pick one above to correct it.
+              </p>
+            )}
+            {!LOGIN_ROLES.includes(form.account_type) && (
+              <p className="mt-1.5 text-xs text-gray-400">
+                Vehicle record only &mdash; no sign-in account is created.
+              </p>
+            )}
           </div>
 
           {/* Student-only: Grade */}
@@ -400,23 +423,28 @@ function UserModal({ mode, initial, allStudents, onSave, onClose }: UserModalPro
             </div>
           )}
 
-          {/* Guardian-only fields */}
+          {/* Plates for every role except students. Faculty and staff rows
+              exist precisely so the gate recognises their car, so hiding this
+              behind "guardian" made those records un-editable here. */}
+          {form.account_type !== "student" && (
+            <div>
+              <label className="block text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1.5">
+                License Plates
+                <span className="ml-1 text-gray-400 normal-case font-normal">(comma-separated)</span>
+              </label>
+              <input
+                type="text"
+                value={form.licensePlateNumbers}
+                onChange={(e) => set("licensePlateNumbers", e.target.value)}
+                placeholder="ABC-1234, XYZ-5678"
+                className="w-full px-3 py-2.5 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 font-mono"
+              />
+            </div>
+          )}
+
+          {/* Guardian-only: links to the students they pick up. */}
           {form.account_type === "guardian" && (
             <>
-              <div>
-                <label className="block text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1.5">
-                  License Plates
-                  <span className="ml-1 text-gray-400 normal-case font-normal">(comma-separated)</span>
-                </label>
-                <input
-                  type="text"
-                  value={form.licensePlateNumbers}
-                  onChange={(e) => set("licensePlateNumbers", e.target.value)}
-                  placeholder="ABC-1234, XYZ-5678"
-                  className="w-full px-3 py-2.5 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 font-mono"
-                />
-              </div>
-
               <div>
                 <label className="block text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1.5">
                   Linked Student IDs
@@ -536,9 +564,9 @@ function DeleteConfirmModal({
             <path strokeLinecap="round" strokeLinejoin="round" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
           </svg>
         </div>
-        <h3 className="text-lg font-bold text-gray-900 text-center mb-1">Delete User</h3>
+        <h3 className="text-lg font-bold text-gray-900 text-center mb-1">Archive User</h3>
         <p className="text-sm text-gray-500 text-center mb-6">
-          Are you sure you want to delete <span className="font-semibold text-gray-700">{userName}</span>? This cannot be undone.
+          Archive <span className="font-semibold text-gray-700">{userName}</span>? They will stop matching at the gate and can no longer sign in, but nothing is deleted &mdash; you can restore them at any time. Archived accounts are purged automatically after 90 days.
         </p>
         <div className="flex gap-3">
           <button
@@ -559,7 +587,7 @@ function DeleteConfirmModal({
             {deleting && (
               <span className="w-3.5 h-3.5 border-2 border-white border-t-transparent rounded-full animate-spin" />
             )}
-            Delete
+            Archive
           </button>
         </div>
       </div>
@@ -904,7 +932,9 @@ function UserManagementContent() {
   const searchParams = useSearchParams();
 
   const [allUsers, setAllUsers] = useState<AppUser[]>([]);
-  const [filter, setFilter] = useState<"all" | "guardian" | "student">("all");
+  // Any account_type, not just guardian/student — the roster is mostly
+  // faculty vehicle records now.
+  const [filter, setFilter] = useState<string>("all");
   const [searchQuery, setSearchQuery] = useState("");
   const [expandedGuardian, setExpandedGuardian] = useState<string | null>(null);
   type SortColumn = "name" | "email" | "account_type" | "onboarding";
@@ -949,6 +979,8 @@ function UserManagementContent() {
           fcmToken: data.fcmToken,
           fcmTokenUpdatedAt: data.fcmTokenUpdatedAt,
           onboardingComplete: data.onboardingComplete,
+          // Legacy documents predate soft delete and have no status field.
+          status: data.status === "archived" ? "archived" : "active",
         });
       });
       setAllUsers(usersData);
@@ -1038,8 +1070,14 @@ function UserManagementContent() {
     if (form.account_type === "student") {
       base.grade = form.grade ? parseInt(form.grade, 10) : null;
     } else {
+      // Any non-student role can own vehicles.
       base.licensePlateNumbers = splitCsv(form.licensePlateNumbers);
-      base.wardIds = splitCsv(form.wardIds);
+      // Only guardians pick students up, so only they carry wardIds. Writing
+      // an empty array onto faculty rows would make the plate-index trigger
+      // and the security rules reason about links that do not exist.
+      if (form.account_type === "guardian") {
+        base.wardIds = splitCsv(form.wardIds);
+      }
     }
     return base;
   };
@@ -1049,44 +1087,112 @@ function UserManagementContent() {
     await updateDoc(doc(db, "users", editTarget.id), buildPayload(form));
   };
 
+  // Creating a user goes through a callable, never addDoc().
+  //
+  // addDoc() mints a RANDOM document id, but every read in the app and website
+  // is doc(db,'users',<auth uid>). Users created here therefore showed up in
+  // this list yet could never load their own profile after signing in. The
+  // callable creates the Auth account first and keys the document by that UID.
   const handleAdd = async (form: UserFormData) => {
-    if (!db) throw new Error("Firebase not initialized");
-    await addDoc(collection(db, "users"), {
-      ...buildPayload(form),
-      createdAt: serverTimestamp(),
+    if (!functions) throw new Error("Firebase not initialized");
+    const payload = buildPayload(form) as Record<string, unknown>;
+    const result = await httpsCallable<
+      Record<string, unknown>,
+      { uid: string; created: boolean; resetLink: string | null }
+    >(
+      functions,
+      "createUserAccount",
+    )({
+      email: payload.email,
+      name: payload.name,
+      accountType: form.account_type,
+      grade: form.account_type === "student" && form.grade
+        ? parseInt(form.grade, 10)
+        : undefined,
+      wardIds: form.account_type === "guardian"
+        ? splitCsv(form.wardIds)
+        : undefined,
+      vehicles: form.account_type === "guardian"
+        ? splitCsv(form.licensePlateNumbers).map((plate) => ({
+            plate,
+            plateNormalized: plate.toUpperCase().replace(/[^A-Z0-9]/g, ""),
+            description: null,
+          }))
+        : undefined,
     });
+
+    // No password is ever set or shared — the account is claimed via this
+    // link. TODO: surface this in the modal instead of the console.
+    if (result.data.resetLink) {
+      console.info(
+        `[users] password setup link for ${String(payload.email)}:\n` +
+          result.data.resetLink,
+      );
+    }
   };
 
+  // Archive, never delete. A hard delete is what destroyed the users
+  // collection; archiving is reversible and the plate index drops an archived
+  // guardian automatically, so they stop matching at the gate right away.
   const handleDelete = async (u: AppUser) => {
-    if (!db) throw new Error("Firebase not initialized");
-    await deleteDoc(doc(db, "users", u.id));
+    if (!functions) throw new Error("Firebase not initialized");
+    await httpsCallable(functions, "archiveUser")({ uid: u.id });
+  };
+
+  const handleRestore = async (u: AppUser) => {
+    if (!functions) throw new Error("Firebase not initialized");
+    await httpsCallable(functions, "restoreUser")({ uid: u.id });
   };
 
   const handleImport = async (rows: PartitionedRow[]): Promise<ImportResult> => {
-    if (!db) throw new Error("Firebase not initialized");
+    if (!db || !functions) throw new Error("Firebase not initialized");
     const database = db;
+    const fns = functions;
     let created = 0;
     let updated = 0;
+    let skipped = 0;
 
-    // Batch, chunked at 400 ops per commit.
-    for (let i = 0; i < rows.length; i += 400) {
-      const chunk = rows.slice(i, i + 400);
+    // New users need an Auth account, so they go one-at-a-time through the
+    // callable rather than a client batch. Updates to existing users are still
+    // batched, chunked at 400 ops per commit.
+    const newRows = rows.filter((r) => r.tag === "new");
+    const existingRows = rows.filter((r) => r.tag === "existing");
+
+    for (const row of newRows) {
+      try {
+        await httpsCallable(fns, "createUserAccount")({
+          email: row.data.email,
+          name: row.data.name || undefined,
+          accountType: row.data.account_type || "guardian",
+          grade: row.data.account_type === "student" && row.data.grade
+            ? parseInt(row.data.grade, 10)
+            : undefined,
+          vehicles: row.data.plates.map((plate) => ({
+            plate,
+            plateNormalized: plate.toUpperCase().replace(/[^A-Z0-9]/g, ""),
+            description: null,
+          })),
+        });
+        created++;
+      } catch (err) {
+        console.error(`import: row ${row.rowNumber} (${row.data.email})`, err);
+        skipped++;
+      }
+    }
+
+    for (let i = 0; i < existingRows.length; i += 400) {
+      const chunk = existingRows.slice(i, i + 400);
       const batch = writeBatch(database);
       for (const row of chunk) {
-        if (row.tag === "new") {
-          const ref = doc(collection(database, "users"));
-          batch.set(ref, { ...newUserPayload(row.data), createdAt: serverTimestamp() });
-          created++;
-        } else if (row.tag === "existing" && row.existingUser) {
-          const ref = doc(database, "users", row.existingUser.id);
-          batch.update(ref, updateUserPayload(row.data, row.existingUser));
-          updated++;
-        }
+        if (!row.existingUser) continue;
+        const ref = doc(database, "users", row.existingUser.id);
+        batch.update(ref, updateUserPayload(row.data, row.existingUser));
+        updated++;
       }
       await batch.commit();
     }
 
-    return { created, updated, skipped: 0 };
+    return { created, updated, skipped };
   };
 
   if (loading) {
@@ -1170,6 +1276,27 @@ function UserManagementContent() {
               className="block w-full pl-9 pr-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 text-sm"
             />
           </div>
+
+          {/* Account-type filter. Built from the types actually present, so a
+              stray value such as the "facilty" typo is visible rather than
+              hidden behind a hard-coded list. */}
+          <select
+            value={filter}
+            onChange={(e) => setFilter(e.target.value)}
+            className="px-3 py-2 text-sm border border-gray-300 rounded-lg bg-white focus:outline-none focus:ring-2 focus:ring-blue-500"
+          >
+            <option value="all">All types</option>
+            {Array.from(new Set(allUsers.map((u) => u.account_type)))
+              .filter(Boolean)
+              .sort()
+              .map((t) => (
+                <option key={t} value={t}>
+                  {t}
+                  {isKnownAccountType(t) ? "" : "  ⚠ typo?"}
+                </option>
+              ))}
+          </select>
+
           <span className="text-sm text-gray-500 ml-auto">{displayUsers.length} users</span>
         </div>
 
@@ -1342,16 +1469,28 @@ function UserManagementContent() {
                               </svg>
                             </button>
 
-                            {/* Delete */}
-                            <button
-                              onClick={() => setDeleteTarget(u)}
-                              title="Delete user"
-                              className="inline-flex items-center justify-center w-8 h-8 text-gray-400 bg-white border border-gray-200 rounded-lg hover:bg-red-50 hover:text-red-600 hover:border-red-200 transition"
-                            >
-                              <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth={2}>
-                                <path strokeLinecap="round" strokeLinejoin="round" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
-                              </svg>
-                            </button>
+                            {/* Archive / Restore — never a hard delete. */}
+                            {u.status === "archived" ? (
+                              <button
+                                onClick={() => handleRestore(u)}
+                                title="Restore user"
+                                className="inline-flex items-center justify-center w-8 h-8 text-gray-400 bg-white border border-gray-200 rounded-lg hover:bg-green-50 hover:text-green-600 hover:border-green-200 transition"
+                              >
+                                <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth={2}>
+                                  <path strokeLinecap="round" strokeLinejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                                </svg>
+                              </button>
+                            ) : (
+                              <button
+                                onClick={() => setDeleteTarget(u)}
+                                title="Archive user"
+                                className="inline-flex items-center justify-center w-8 h-8 text-gray-400 bg-white border border-gray-200 rounded-lg hover:bg-red-50 hover:text-red-600 hover:border-red-200 transition"
+                              >
+                                <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth={2}>
+                                  <path strokeLinecap="round" strokeLinejoin="round" d="M5 8h14M5 8a2 2 0 110-4h14a2 2 0 110 4M5 8v10a2 2 0 002 2h10a2 2 0 002-2V8m-9 4h4" />
+                                </svg>
+                              </button>
+                            )}
                           </div>
                         </td>
                       </tr>
