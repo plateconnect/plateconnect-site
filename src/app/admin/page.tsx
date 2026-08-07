@@ -563,11 +563,9 @@ export default function AdminDashboardPage() {
     return filtered;
   }, [groupedNotices, searchQuery, startDate, endDate, startTime, endTime, selectedLocations, selectedPersonTypes, statusFilter]);
 
-  // Oldest arrival actually loaded, for the "back to ..." hint in the footer.
-  const oldestLoaded = useMemo(() => {
-    const last = notices[notices.length - 1];
-    return last?.arrival_time ? last.arrival_time.toDate() : null;
-  }, [notices]);
+  // More documents exist than are currently loaded.
+  const remainingArrivals =
+    totalArrivals !== null ? Math.max(0, totalArrivals - notices.length) : 0;
 
   const totalPages = Math.max(1, Math.ceil(filteredNotices.length / pageSize));
   const pagedNotices = filteredNotices.slice((currentPage - 1) * pageSize, currentPage * pageSize);
@@ -705,7 +703,25 @@ export default function AdminDashboardPage() {
                 label: "Loaded", value: stats.allTime, icon: (
                   <svg className="w-4 h-4 text-gray-600" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M4 7v10c0 2.21 3.582 4 8 4s8-1.79 8-4V7M4 7c0 2.21 3.582 4 8 4s8-1.79 8-4M4 7c0-2.21 3.582-4 8-4s8 1.79 8 4" /></svg>
                 ), iconBg: "bg-gray-100",
-                sub: <div className="text-xs text-gray-400 mt-2">total records</div>,
+                // The card counts displayed ROWS (arrived/left pairs merged into
+                // one), while the total counts raw documents, so the two are not
+                // the same unit — the gap is the merged pairs.
+                sub: (
+                  <div className="mt-2 space-y-2">
+                    <div className="text-xs text-gray-400">
+                      out of {totalArrivals !== null ? totalArrivals.toLocaleString() : "…"} total records
+                    </div>
+                    {remainingArrivals > 0 && (
+                      <button
+                        type="button"
+                        onClick={() => setRowLimit((n) => n + ARRIVALS_PAGE_ROWS)}
+                        className="px-2.5 py-1 rounded-lg text-xs font-medium text-blue-600 border border-blue-200 hover:bg-blue-50 transition"
+                      >
+                        Load {Math.min(ARRIVALS_PAGE_ROWS, remainingArrivals).toLocaleString()} more
+                      </button>
+                    )}
+                  </div>
+                ),
                 color: "text-gray-900",
                 range: undefined,
               },
@@ -1029,24 +1045,6 @@ export default function AdminDashboardPage() {
               </div>
             )}
 
-            {/* How far back the table reaches. Stated explicitly so a bounded
-                load never looks like missing data. */}
-            <div className="px-4 py-3 border-t border-gray-100 flex flex-wrap items-center justify-between gap-2">
-              <span className="text-xs text-gray-400">
-                Loaded the {notices.length.toLocaleString()} most recent arrivals
-                {totalArrivals !== null && ` of ${totalArrivals.toLocaleString()}`}
-                {oldestLoaded && ` · back to ${formatDateShort(oldestLoaded)} ${formatTimeShort(oldestLoaded)}`}
-              </span>
-              {totalArrivals !== null && notices.length < totalArrivals && (
-                <button
-                  type="button"
-                  onClick={() => setRowLimit((n) => n + ARRIVALS_PAGE_ROWS)}
-                  className="px-3 py-1.5 rounded-lg text-xs font-medium text-blue-600 border border-blue-200 hover:bg-blue-50 transition"
-                >
-                  Load {Math.min(ARRIVALS_PAGE_ROWS, totalArrivals - notices.length).toLocaleString()} older
-                </button>
-              )}
-            </div>
           </div>
         </div>
       </div>
