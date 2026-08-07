@@ -471,6 +471,23 @@ export default function AdminDashboardPage() {
     };
   }, [groupedNotices]);
 
+  // Day keys for the clickable stat cards. zonedDayKey returns "YYYY-MM-DD",
+  // the same shape the date inputs and the range filter already use, so these
+  // drive the existing filter rather than adding a parallel one.
+  const todayKey = zonedDayKey(new Date());
+  const weekStartKey = currentWeekStartKey();
+
+  /** Apply a date range from a stat card, or clear it if already applied. */
+  const applyRange = (start: string, end: string) => {
+    if (startDate === start && endDate === end) {
+      setStartDate("");
+      setEndDate("");
+    } else {
+      setStartDate(start);
+      setEndDate(end);
+    }
+  };
+
   const syncLabel = useMemo(() => {
     if (!lastSyncTime) return null;
     const diffSec = Math.floor((now.getTime() - lastSyncTime.getTime()) / 1000);
@@ -643,6 +660,7 @@ export default function AdminDashboardPage() {
                 ), iconBg: "bg-blue-50",
                 sub: <div className="flex items-center gap-3 mt-2"><span className="text-xs text-yellow-600 bg-yellow-50 px-2 py-0.5 rounded-full">{stats.todayArrived} arrived</span><span className="text-xs text-green-600 bg-green-50 px-2 py-0.5 rounded-full">{stats.todayLeft} left</span></div>,
                 color: "text-gray-900",
+                range: { start: todayKey, end: todayKey },
               },
               {
                 label: "This Week", value: stats.weekTotal, icon: (
@@ -650,6 +668,7 @@ export default function AdminDashboardPage() {
                 ), iconBg: "bg-indigo-50",
                 sub: <div className="text-xs text-gray-400 mt-2">arrivals</div>,
                 color: "text-gray-900",
+                range: { start: weekStartKey, end: todayKey },
               },
               {
                 // Was "All Time". The table now loads a bounded window, and at
@@ -661,6 +680,7 @@ export default function AdminDashboardPage() {
                 ), iconBg: "bg-gray-100",
                 sub: <div className="text-xs text-gray-400 mt-2">total records</div>,
                 color: "text-gray-900",
+                range: undefined,
               },
               {
                 label: "Awaiting Pickup", value: stats.todayArrived, icon: (
@@ -668,17 +688,58 @@ export default function AdminDashboardPage() {
                 ), iconBg: "bg-yellow-50",
                 sub: <div className="text-xs text-gray-400 mt-2">on campus</div>,
                 color: "text-yellow-600",
+                range: undefined,
               },
-            ].map((s) => (
-              <div key={s.label} className="bg-white rounded-xl border border-gray-200 p-5">
-                <div className="flex items-center justify-between mb-3">
-                  <span className="text-xs font-medium text-gray-400 uppercase tracking-wider">{s.label}</span>
-                  <span className={`w-8 h-8 rounded-lg ${s.iconBg} flex items-center justify-center`}>{s.icon}</span>
-                </div>
-                <div className={`text-3xl font-bold ${s.color}`}>{s.value}</div>
-                {s.sub}
-              </div>
-            ))}
+            ].map((s) => {
+              const active = s.range
+                ? startDate === s.range.start && endDate === s.range.end
+                : false;
+              const body = (
+                <>
+                  <div className="flex items-center justify-between mb-3">
+                    <span className="text-xs font-medium text-gray-400 uppercase tracking-wider">{s.label}</span>
+                    <span className={`w-8 h-8 rounded-lg ${s.iconBg} flex items-center justify-center`}>{s.icon}</span>
+                  </div>
+                  <div className={`text-3xl font-bold ${s.color}`}>{s.value}</div>
+                  {s.sub}
+                </>
+              );
+
+              // Cards with a date range double as filter buttons; the rest stay
+              // plain so nothing looks clickable when it isn't.
+              if (!s.range) {
+                return (
+                  <div key={s.label} className="bg-white rounded-xl border border-gray-200 p-5">
+                    {body}
+                  </div>
+                );
+              }
+
+              const range = s.range;
+              return (
+                <button
+                  key={s.label}
+                  type="button"
+                  aria-pressed={active}
+                  title={active
+                    ? `Showing ${s.label.toLowerCase()} only — click to clear`
+                    : `Filter the table to ${s.label.toLowerCase()}`}
+                  onClick={() => applyRange(range.start, range.end)}
+                  className={`bg-white rounded-xl border p-5 text-left w-full transition cursor-pointer ${
+                    active
+                      ? "border-blue-500 ring-2 ring-blue-100"
+                      : "border-gray-200 hover:border-gray-300 hover:shadow-sm"
+                  }`}
+                >
+                  {body}
+                  {active && (
+                    <div className="mt-2 text-xs font-medium text-blue-600">
+                      Filtering table &middot; click to clear
+                    </div>
+                  )}
+                </button>
+              );
+            })}
           </div>
 
           {/* Search + Filter Bar */}
