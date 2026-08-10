@@ -66,6 +66,9 @@ const DEFAULT_ROLE_COLORS: Record<string, string> = {
 
 const FALLBACK_ROLE_COLOR = "#6b7280";
 
+const USERS_PAGE_SIZE_OPTIONS = [10, 25, 50, 100, 200];
+const DEFAULT_USERS_PAGE_SIZE = 50;
+
 function hexToRgba(hex: string, alpha: number): string {
   const m = /^#?([0-9a-f]{6})$/i.exec(hex.trim());
   if (!m) return `rgba(107, 114, 128, ${alpha})`;
@@ -971,6 +974,9 @@ function UserManagementContent() {
   // faculty vehicle records now.
   const [filter, setFilter] = useState<string>("all");
 
+  const [pageSize, setPageSize] = useState(DEFAULT_USERS_PAGE_SIZE);
+  const [currentPage, setCurrentPage] = useState(1);
+
   const [roleColors, setRoleColors] = useState<Record<string, string>>(DEFAULT_ROLE_COLORS);
   const [showColorPanel, setShowColorPanel] = useState(false);
   const [colorSaveState, setColorSaveState] = useState<"idle" | "saving" | "saved" | "error">("idle");
@@ -1119,6 +1125,21 @@ function UserManagementContent() {
 
     return sorted;
   }, [allUsers, filter, searchQuery, sort]);
+
+  const totalPages = Math.max(1, Math.ceil(displayUsers.length / pageSize));
+  const pagedUsers = displayUsers.slice(
+    (currentPage - 1) * pageSize,
+    currentPage * pageSize,
+  );
+
+  // Narrowing the result set can leave you on a page that no longer exists.
+  useEffect(() => {
+    setCurrentPage(1);
+  }, [filter, searchQuery, pageSize]);
+
+  useEffect(() => {
+    setCurrentPage((p) => Math.min(p, totalPages));
+  }, [totalPages]);
 
   const stats = useMemo(() => {
     const guardians = allUsers.filter((u) => u.account_type === "guardian");
@@ -1383,6 +1404,21 @@ function UserManagementContent() {
             Role colors
           </button>
 
+          <label className="flex items-center gap-2 text-sm text-gray-500">
+            <span className="whitespace-nowrap">Per page</span>
+            <select
+              value={pageSize}
+              onChange={(e) => setPageSize(Number(e.target.value))}
+              className="px-3 py-2 text-sm border border-gray-300 rounded-lg bg-white text-gray-700 focus:outline-none focus:ring-2 focus:ring-blue-500"
+            >
+              {USERS_PAGE_SIZE_OPTIONS.map((size) => (
+                <option key={size} value={size}>
+                  {size}
+                </option>
+              ))}
+            </select>
+          </label>
+
           <span className="text-sm text-gray-500 ml-auto">{displayUsers.length} users</span>
         </div>
 
@@ -1527,7 +1563,7 @@ function UserManagementContent() {
                 </tr>
               </thead>
               <tbody>
-                {displayUsers.map((u) => {
+                {pagedUsers.map((u) => {
                   const isIncomplete = u.onboardingComplete === false;
                   const isGuardian = u.account_type === "guardian";
                   const isExpanded = expandedGuardian === u.id;
@@ -1677,6 +1713,34 @@ function UserManagementContent() {
           {displayUsers.length === 0 && (
             <div className="p-12 text-center text-gray-400 text-sm">
               No users match your current filter.
+            </div>
+          )}
+
+          {displayUsers.length > pageSize && (
+            <div className="px-4 py-2.5 border-t border-gray-100 flex items-center justify-between">
+              <span className="text-xs text-gray-400">
+                {(currentPage - 1) * pageSize + 1}–
+                {Math.min(currentPage * pageSize, displayUsers.length)} of {displayUsers.length}
+              </span>
+              <div className="flex items-center gap-1">
+                <button
+                  onClick={() => setCurrentPage((p) => Math.max(1, p - 1))}
+                  disabled={currentPage === 1}
+                  className="px-3 py-1.5 rounded-lg text-xs font-medium text-gray-600 hover:bg-gray-100 disabled:opacity-30 disabled:cursor-not-allowed transition"
+                >
+                  Previous
+                </button>
+                <span className="px-2 text-xs text-gray-500 whitespace-nowrap">
+                  {currentPage} / {totalPages}
+                </span>
+                <button
+                  onClick={() => setCurrentPage((p) => Math.min(totalPages, p + 1))}
+                  disabled={currentPage === totalPages}
+                  className="px-3 py-1.5 rounded-lg text-xs font-medium text-gray-600 hover:bg-gray-100 disabled:opacity-30 disabled:cursor-not-allowed transition"
+                >
+                  Next
+                </button>
+              </div>
             </div>
           )}
         </div>
