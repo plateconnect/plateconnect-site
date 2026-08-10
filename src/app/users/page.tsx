@@ -11,6 +11,8 @@ import {
   doc,
   updateDoc,
   writeBatch,
+  getDoc,
+  setDoc,
 } from "firebase/firestore";
 import { httpsCallable } from "firebase/functions";
 import Sidebar from "@/components/Sidebar";
@@ -45,6 +47,39 @@ const ACCOUNT_TYPES = [
 ] as const;
 
 type AccountType = (typeof ACCOUNT_TYPES)[number]["value"];
+
+// Role badge colours, stored in Firestore (settings/roleColors) rather than
+// localStorage so every admin sees the same scheme instead of a per-browser
+// one. It is a single document read per page load.
+//
+// Stored as one hex per role and expanded into a background/text/border set at
+// render time. Tailwind classes are compiled ahead of time, so a user-chosen
+// colour cannot be expressed as a class name and has to be an inline style.
+const DEFAULT_ROLE_COLORS: Record<string, string> = {
+  guardian: "#2563eb",
+  student: "#16a34a",
+  faculty: "#0d9488",
+  teacher: "#7c3aed",
+  admin: "#db2777",
+  staff: "#64748b",
+};
+
+const FALLBACK_ROLE_COLOR = "#6b7280";
+
+function hexToRgba(hex: string, alpha: number): string {
+  const m = /^#?([0-9a-f]{6})$/i.exec(hex.trim());
+  if (!m) return `rgba(107, 114, 128, ${alpha})`;
+  const n = parseInt(m[1], 16);
+  return `rgba(${(n >> 16) & 255}, ${(n >> 8) & 255}, ${n & 255}, ${alpha})`;
+}
+
+function roleBadgeStyle(color: string): React.CSSProperties {
+  return {
+    backgroundColor: hexToRgba(color, 0.12),
+    color,
+    border: `1px solid ${hexToRgba(color, 0.25)}`,
+  };
+}
 
 const isKnownAccountType = (v: string): v is AccountType =>
   ACCOUNT_TYPES.some((t) => t.value === v);
@@ -935,6 +970,10 @@ function UserManagementContent() {
   // Any account_type, not just guardian/student — the roster is mostly
   // faculty vehicle records now.
   const [filter, setFilter] = useState<string>("all");
+
+  const [roleColors, setRoleColors] = useState<Record<string, string>>(DEFAULT_ROLE_COLORS);
+  const [showColorPanel, setShowColorPanel] = useState(false);
+  const [colorSaveState, setColorSaveState] = useState<"idle" | "saving" | "saved" | "error">("idle");
   const [searchQuery, setSearchQuery] = useState("");
   const [expandedGuardian, setExpandedGuardian] = useState<string | null>(null);
   type SortColumn = "name" | "email" | "account_type" | "onboarding";
@@ -987,6 +1026,41 @@ function UserManagementContent() {
     });
     return () => unsubscribe();
   }, [user]);
+
+  // Role colours: one document read, merged over the defaults so a role added
+  // later still renders even if it was never saved.
+  useEffect(() => {
+    if (!user || !db) return;
+    let cancelled = false;
+    getDoc(doc(db, "settings", "roleColors"))
+      .then((snap) => {
+        if (cancelled || !snap.exists()) return;
+        setRoleColors({ ...DEFAULT_ROLE_COLORS, ...(snap.data() as Record<string, string>) });
+      })
+      .catch(() => {
+        // Fall back to the defaults; a missing document is not an error.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [user]);
+
+  const saveRoleColors = async (next: Record<string, string>) => {
+    setRoleColors(next);
+    if (!db) return;
+    setColorSaveState("saving");
+    try {
+      await setDoc(doc(db, "settings", "roleColors"), next, { merge: true });
+      setColorSaveState("saved");
+      setTimeout(() => setColorSaveState("idle"), 2000);
+    } catch (err) {
+      console.error("[users] could not save role colours", err);
+      setColorSaveState("error");
+    }
+  };
+
+  const colorForRole = (role: string) =>
+    roleColors[role] || DEFAULT_ROLE_COLORS[role] || FALLBACK_ROLE_COLOR;
 
   // Handle ?guardian= deep-link
   useEffect(() => {
@@ -1297,8 +1371,82 @@ function UserManagementContent() {
               ))}
           </select>
 
+          <button
+            type="button"
+            onClick={() => setShowColorPanel((v) => !v)}
+            className="px-3 py-2 text-sm border border-gray-300 rounded-lg bg-white text-gray-600 hover:bg-gray-50 transition inline-flex items-center gap-2"
+            aria-expanded={showColorPanel}
+          >
+            <svg className="w-4 h-4 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth={2}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M7 21a4 4 0 01-4-4V5a2 2 0 012-2h4a2 2 0 012 2v12a4 4 0 01-4 4zm0 0h12a2 2 0 002-2v-4a2 2 0 00-2-2h-2.343M11 7.343l1.657-1.657a2 2 0 012.828 0l2.829 2.829a2 2 0 010 2.828L11 19.172M7 17h.01" />
+            </svg>
+            Role colors
+          </button>
+
           <span className="text-sm text-gray-500 ml-auto">{displayUsers.length} users</span>
         </div>
+
+        {/* Role colour editor. Shown on demand so it does not compete with the
+            table for attention. */}
+        {showColorPanel && (
+          <div className="bg-white rounded-xl border border-gray-200 p-4 mb-6">
+            <div className="flex items-center justify-between mb-3">
+              <div>
+                <h3 className="text-sm font-semibold text-gray-800">Role colors</h3>
+                <p className="text-xs text-gray-400 mt-0.5">
+                  Saved for everyone, not just this browser. Changes apply immediately.
+                </p>
+              </div>
+              <div className="flex items-center gap-3">
+                {colorSaveState === "saving" && <span className="text-xs text-gray-400">Saving…</span>}
+                {colorSaveState === "saved" && <span className="text-xs text-green-600">Saved</span>}
+                {colorSaveState === "error" && (
+                  <span className="text-xs text-red-600">Could not save — admin access required</span>
+                )}
+                <button
+                  type="button"
+                  onClick={() => saveRoleColors({ ...DEFAULT_ROLE_COLORS })}
+                  className="px-2.5 py-1 rounded-lg text-xs font-medium text-gray-600 border border-gray-200 hover:bg-gray-50 transition"
+                >
+                  Reset to defaults
+                </button>
+              </div>
+            </div>
+
+            <div className="flex flex-wrap gap-3">
+              {/* Every configured role, plus any value actually present in the
+                  data — so a stray type like the "facilty" typo is colourable
+                  rather than stuck on the fallback grey. */}
+              {Array.from(
+                new Set([
+                  ...ACCOUNT_TYPES.map((t) => t.value as string),
+                  ...allUsers.map((u) => u.account_type).filter(Boolean),
+                ]),
+              )
+                .sort()
+                .map((role) => (
+                  <div
+                    key={role}
+                    className="flex items-center gap-2 border border-gray-200 rounded-lg px-2.5 py-2"
+                  >
+                    <input
+                      type="color"
+                      aria-label={`Color for ${role}`}
+                      value={colorForRole(role)}
+                      onChange={(e) => saveRoleColors({ ...roleColors, [role]: e.target.value })}
+                      className="w-7 h-7 rounded cursor-pointer border border-gray-200 bg-white p-0.5"
+                    />
+                    <span
+                      className="px-2.5 py-1 rounded-full text-xs font-semibold capitalize"
+                      style={roleBadgeStyle(colorForRole(role))}
+                    >
+                      {role}
+                    </span>
+                  </div>
+                ))}
+            </div>
+          </div>
+        )}
 
         {/* User Table */}
         <div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
@@ -1419,13 +1567,8 @@ function UserManagementContent() {
                         {/* Type */}
                         <td className="px-6 py-4">
                           <span
-                            className={`px-2.5 py-1 rounded-full text-xs font-semibold capitalize ${
-                              isGuardian
-                                ? "bg-blue-100 text-blue-800"
-                                : u.account_type === "student"
-                                ? "bg-green-100 text-green-800"
-                                : "bg-gray-100 text-gray-600"
-                            }`}
+                            className="px-2.5 py-1 rounded-full text-xs font-semibold capitalize"
+                            style={roleBadgeStyle(colorForRole(u.account_type))}
                           >
                             {u.account_type}
                           </span>
