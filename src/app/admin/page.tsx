@@ -47,17 +47,44 @@ interface Notice {
   departure_image_url?: string;
 }
 
+interface PersonInfo {
+  name: string;
+  account_type: string;
+}
+
 /**
- * Who to show for an arrival.
+ * Who to show for an arrival, and under which role.
  *
- * A guardian arrival is about the students being collected, so their names win.
- * Faculty and staff have no wards, which is why those rows rendered blank —
- * fall back to the matched person's own name. Both fields are denormalised onto
- * the arrival by firebase_send.py at detection time, so this costs no reads.
+ * Resolved against the live `users` collection first, then falling back to the
+ * person_name/person_type denormalised onto the arrival by firebase_send.py.
+ *
+ * The live lookup is what keeps these columns in step with user management: a
+ * rename or a role correction shows up immediately, and rows written by a
+ * pipeline that predates those denormalised fields still resolve. The stored
+ * copy remains the fallback so arrivals whose user has since been deleted keep
+ * showing who it was at the time, rather than going blank.
+ *
+ * A guardian arrival is about the students being collected, so ward names win;
+ * faculty and staff have no wards, hence the fall back to their own name.
  */
-function displayName(n: Notice): string {
-  if (n.ward_names.length > 0) return n.ward_names.join(", ");
-  return n.person_name || "—";
+function personFor(n: Notice, users: Map<string, PersonInfo>): PersonInfo {
+  const live = n.owner_id ? users.get(n.owner_id) : undefined;
+
+  const liveWardNames = (n.ward_ids ?? [])
+    .map((id) => users.get(id)?.name)
+    .filter((v): v is string => Boolean(v));
+
+  const name =
+    liveWardNames.length > 0
+      ? liveWardNames.join(", ")
+      : n.ward_names.length > 0
+        ? n.ward_names.join(", ")
+        : live?.name || n.person_name || "—";
+
+  return {
+    name,
+    account_type: live?.account_type || n.person_type || "unknown",
+  };
 }
 
 function groupArrivals(raw: Notice[]): Notice[] {
@@ -112,7 +139,11 @@ function statusLabel(status?: string) {
   return "Not set";
 }
 
-function exportToCsv(rows: Notice[], scope: ExportScope) {
+function exportToCsv(
+  rows: Notice[],
+  scope: ExportScope,
+  users: Map<string, PersonInfo>,
+) {
   const headers = [
     "Type",
     "Name",
@@ -131,9 +162,10 @@ function exportToCsv(rows: Notice[], scope: ExportScope) {
   const lines = rows.map((n) => {
     const arrival = n.arrival_time.toDate();
     const departure = n.departure_time?.toDate();
+    const person = personFor(n, users);
     return [
-      n.person_type ?? "unknown",
-      displayName(n),
+      person.account_type,
+      person.name,
       n.license_plate ?? "",
       statusLabel(n.status),
       arrival.toLocaleDateString([], { timeZone: APP_TIME_ZONE }),
@@ -160,11 +192,16 @@ function exportToCsv(rows: Notice[], scope: ExportScope) {
   URL.revokeObjectURL(url);
 }
 
+// Mirrors ACCOUNT_TYPES on the users page. faculty/admin/staff were missing,
+// so the roles that make up most of the roster could not be filtered for.
 const PERSON_TYPE_OPTIONS = [
   { value: "student", label: "Student" },
   { value: "parent", label: "Parent" },
   { value: "guardian", label: "Guardian" },
   { value: "teacher", label: "Teacher" },
+  { value: "faculty", label: "Faculty" },
+  { value: "admin", label: "Admin" },
+  { value: "staff", label: "Staff" },
   { value: "unknown", label: "Unknown" },
 ];
 
@@ -182,6 +219,9 @@ const PERSON_TYPE_STYLES: Record<string, { bg: string; text: string; dot: string
   parent:   { bg: "bg-purple-50", text: "text-purple-700", dot: "bg-purple-400" },
   guardian: { bg: "bg-purple-50", text: "text-purple-700", dot: "bg-purple-400" },
   teacher:  { bg: "bg-teal-50",   text: "text-teal-700",   dot: "bg-teal-400" },
+  faculty:  { bg: "bg-teal-50",   text: "text-teal-700",   dot: "bg-teal-400" },
+  admin:    { bg: "bg-pink-50",   text: "text-pink-700",   dot: "bg-pink-400" },
+  staff:    { bg: "bg-slate-100", text: "text-slate-600",  dot: "bg-slate-400" },
   unknown:  { bg: "bg-gray-100",  text: "text-gray-500",   dot: "bg-gray-300" },
 };
 
@@ -398,6 +438,7 @@ export default function AdminDashboardPage() {
   // reading history is paid only when someone actually asks for it.
   const [rowLimit, setRowLimit] = useState(ARRIVALS_INITIAL_ROWS);
   const [totalArrivals, setTotalArrivals] = useState<number | null>(null);
+  const [userMap, setUserMap] = useState<Map<string, PersonInfo>>(new Map());
 
   const [startDate, setStartDate] = useState("");
   const [endDate, setEndDate] = useState("");
@@ -446,7 +487,7 @@ export default function AdminDashboardPage() {
           license_plate: data.licensePlate,
           image_url: data.image_url,
           ward_ids: data.ward_ids,
-          person_type: data.person_type || "unknown",
+          person_type: data.person_type,
           person_name: data.person_name,
           entrance_location: data.entrance_location,
           status: data.status,
@@ -457,6 +498,25 @@ export default function AdminDashboardPage() {
     });
     return () => unsubscribe();
   }, [user, rowLimit]);
+
+  // Live user directory for resolving names and roles on arrivals. ~105
+  // documents against 2000 arrivals, so a ~5% read increase, and it keeps the
+  // Type and Name columns in step with user management.
+  useEffect(() => {
+    if (!user || !db) return;
+    const unsubscribe = onSnapshot(collection(db, "users"), (snapshot) => {
+      const map = new Map<string, PersonInfo>();
+      snapshot.forEach((docSnap) => {
+        const d = docSnap.data();
+        map.set(docSnap.id, {
+          name: d.name || "",
+          account_type: d.account_type || "",
+        });
+      });
+      setUserMap(map);
+    });
+    return () => unsubscribe();
+  }, [user]);
 
   // Total document count, so "showing X of Y" is honest about what is hidden.
   // A count aggregation bills ~1 read per 1000 matched documents, so this is a
@@ -546,7 +606,7 @@ export default function AdminDashboardPage() {
     }
     if (selectedPersonTypes.length > 0) {
       filtered = filtered.filter((n) =>
-        selectedPersonTypes.includes((n.person_type || "unknown").toLowerCase())
+        selectedPersonTypes.includes(personFor(n, userMap).account_type.toLowerCase())
       );
     }
     if (selectedLocations.length > 0) {
@@ -561,7 +621,11 @@ export default function AdminDashboardPage() {
     else if (statusFilter === "left") filtered = filtered.filter((n) => (n.status || "").toLowerCase() === "left");
     else if (statusFilter === "not-set") filtered = filtered.filter((n) => !["arrived", "left"].includes((n.status || "").toLowerCase()));
     return filtered;
-  }, [groupedNotices, searchQuery, startDate, endDate, startTime, endTime, selectedLocations, selectedPersonTypes, statusFilter]);
+    // userMap matters: the person-type filter resolves through it, so the list
+    // has to recompute once the user directory arrives.
+  }, [groupedNotices, searchQuery, startDate, endDate, startTime, endTime, selectedLocations, selectedPersonTypes, statusFilter, userMap]);
+
+  const personOf = (n: Notice) => personFor(n, userMap);
 
   // More documents exist than are currently loaded.
   const remainingArrivals =
@@ -616,7 +680,7 @@ export default function AdminDashboardPage() {
   };
 
   const handleExport = () => {
-    exportToCsv(getExportRows(exportScope), exportScope);
+    exportToCsv(getExportRows(exportScope), exportScope, userMap);
     setExportModalOpen(false);
   };
 
@@ -927,9 +991,9 @@ export default function AdminDashboardPage() {
                         <tbody key={notice.id} className="group/entry">
                           <tr>
                             <td className={`${CELL} py-2.5 ${edge}`}><StatusBadge status={notice.status} /></td>
-                            <td className={`${CELL} py-2.5 ${edge}`}><PersonTypeBadge type={notice.person_type} /></td>
+                            <td className={`${CELL} py-2.5 ${edge}`}><PersonTypeBadge type={personOf(notice).account_type} /></td>
                             <td className={`${CELL} py-2.5 ${edge}`}>
-                              <span className="text-sm font-medium text-gray-900">{displayName(notice)}</span>
+                              <span className="text-sm font-medium text-gray-900">{personOf(notice).name}</span>
                             </td>
                             <td className={`${CELL} py-2.5 whitespace-nowrap ${edge}`}><StampCell date={arrivalDate} /></td>
                             <td className={`${CELL} py-2.5 ${edge}`}><span className="text-xs text-gray-300">—</span></td>
@@ -947,10 +1011,10 @@ export default function AdminDashboardPage() {
                         <tr>
                           <td className={`${CELL} pt-3 pb-1.5 ${INNER_EDGE}`}><StatusBadge status="left" /></td>
                           <td rowSpan={2} className={`${CELL} py-2.5 align-middle ${edge}`}>
-                            <PersonTypeBadge type={notice.person_type} />
+                            <PersonTypeBadge type={personOf(notice).account_type} />
                           </td>
                           <td rowSpan={2} className={`${CELL} py-2.5 align-middle ${edge}`}>
-                            <span className="text-sm font-medium text-gray-900">{displayName(notice)}</span>
+                            <span className="text-sm font-medium text-gray-900">{personOf(notice).name}</span>
                           </td>
                           <td className={`${CELL} pt-3 pb-1.5 whitespace-nowrap ${INNER_EDGE}`}>
                             <StampCell date={departureDate} />
@@ -995,10 +1059,10 @@ export default function AdminDashboardPage() {
                             <StatusBadge status={notice.status} />
                           </td>
                           <td className="px-3 py-2.5">
-                            <PersonTypeBadge type={notice.person_type} />
+                            <PersonTypeBadge type={personOf(notice).account_type} />
                           </td>
                           <td className="px-3 py-2.5">
-                            <span className="text-sm font-medium text-gray-900">{displayName(notice)}</span>
+                            <span className="text-sm font-medium text-gray-900">{personOf(notice).name}</span>
                           </td>
                           <td className="px-3 py-2.5 whitespace-nowrap">
                             <TimeRangeCell arrival={arrivalDate} departure={departureDate} />
