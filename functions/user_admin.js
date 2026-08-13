@@ -1,5 +1,6 @@
 /**
- * Admin-side user lifecycle: creation, archiving, purging, staff PIN.
+ * Admin-side user lifecycle: creation, archiving, purging, staff PIN,
+ * granting/revoking admin.
  *
  * Standalone module so it survives rewrites of index.js. Hook up with:
  *   const userAdmin = require("./user_admin");
@@ -8,6 +9,7 @@
  *   exports.restoreUser = userAdmin.restoreUser;
  *   exports.purgeArchivedUsers = userAdmin.purgeArchivedUsers;
  *   exports.verifyStaffPin = userAdmin.verifyStaffPin;
+ *   exports.setUserPrivilege = userAdmin.setUserPrivilege;
  */
 const {onCall, HttpsError} = require("firebase-functions/v2/https");
 const {onSchedule} = require("firebase-functions/v2/scheduler");
@@ -195,6 +197,137 @@ const archiveUser = onCall(async (request) => {
   return {uid, status: "archived"};
 });
 
+/**
+ * Count Auth users currently holding the admin claim.
+ *
+ * Reads Auth directly rather than the users/{uid}.admin mirror. The mirror
+ * is written by this same function and by set_claims.py, but a safety check
+ * that decides whether an action is allowed should not trust a copy that
+ * something else could in principle have gotten out of sync — it should
+ * check the thing that actually grants access.
+ * @param {{excludeUid?: string}} opts uid to leave out of the count, so a
+ *   revoke can ask "how many admins remain besides the one being revoked".
+ * @return {Promise<number>}
+ */
+async function countAdmins({excludeUid} = {}) {
+  let count = 0;
+  let pageToken;
+  do {
+    const page = await admin.auth().listUsers(1000, pageToken);
+    for (const u of page.users) {
+      if (u.uid === excludeUid) continue;
+      if (u.customClaims && u.customClaims.admin === true) count++;
+    }
+    pageToken = page.pageToken;
+  } while (pageToken);
+  return count;
+}
+
+/**
+ * Grant or revoke the admin claim for a user. The in-website equivalent of
+ * `set_claims.py --grant admin` / `--revoke admin`.
+ *
+ * set_claims.py leaves three things to the operator's judgment that this
+ * callable enforces instead, since it will be used by less technical staff
+ * through a UI rather than someone comfortable reading a CLI warning:
+ *   - a caller can never change their own admin status. Not just to stop
+ *     someone locking themselves out — requireAdmin() already means the
+ *     caller is an admin, so self-service escalation isn't a risk here, but
+ *     self-revocation by mistake is, and there is no legitimate reason for
+ *     an admin to need to touch their own row through this path.
+ *   - revoking the last remaining admin is refused outright. set_claims.py
+ *     only warns after the fact; this is the button whoever eventually
+ *     causes the Aug-2026-style lockout will click, so it should not let
+ *     that happen silently.
+ *   - every change is written to adminAuditLog: who changed whom, from what
+ *     to what, and when. There was previously no record of who granted
+ *     admin to anyone.
+ *
+ * On revoke, existing sessions are force-refreshed via revokeRefreshTokens
+ * so access ends immediately rather than up to ~1 hour later when the
+ * person's ID token would naturally expire.
+ */
+const setUserPrivilege = onCall(async (request) => {
+  const callerUid = requireAdmin(request);
+  const {uid, admin: grantAdmin} = request.data || {};
+
+  if (!uid) throw new HttpsError("invalid-argument", "uid is required");
+  if (typeof grantAdmin !== "boolean") {
+    throw new HttpsError(
+        "invalid-argument",
+        "admin must be true (grant) or false (revoke)",
+    );
+  }
+  if (uid === callerUid) {
+    throw new HttpsError(
+        "failed-precondition",
+        "You cannot change your own admin status",
+    );
+  }
+
+  let targetUser;
+  try {
+    targetUser = await admin.auth().getUser(uid);
+  } catch (e) {
+    if (e.code === "auth/user-not-found") {
+      throw new HttpsError(
+          "not-found",
+          `No login account for uid ${uid}. Admin access requires one — ` +
+          "this user may only be a vehicle registration.",
+      );
+    }
+    throw e;
+  }
+
+  const wasAdmin = Boolean(
+      targetUser.customClaims && targetUser.customClaims.admin === true,
+  );
+  if (wasAdmin === grantAdmin) {
+    return {uid, admin: grantAdmin, changed: false};
+  }
+
+  if (!grantAdmin) {
+    const remaining = await countAdmins({excludeUid: uid});
+    if (remaining === 0) {
+      throw new HttpsError(
+          "failed-precondition",
+          "Refusing to remove the last admin — grant admin to someone " +
+          "else first, or the portal becomes unreachable.",
+      );
+    }
+  }
+
+  const claims = Object.assign({}, targetUser.customClaims || {});
+  if (grantAdmin) {
+    claims.admin = true;
+  } else {
+    delete claims.admin;
+  }
+  await admin.auth().setCustomUserClaims(uid, claims);
+
+  // Mirror for the admin-list UI — the same field set_claims.py maintains.
+  // Not the gate; security rules and AuthContext read the claim, not this.
+  await admin.firestore().collection("users").doc(uid).set({
+    admin: grantAdmin,
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+  }, {merge: true});
+
+  if (!grantAdmin) {
+    await admin.auth().revokeRefreshTokens(uid);
+  }
+
+  await admin.firestore().collection("adminAuditLog").add({
+    action: grantAdmin ? "grant_admin" : "revoke_admin",
+    targetUid: uid,
+    targetEmail: targetUser.email || null,
+    actorUid: callerUid,
+    actorEmail: (request.auth.token && request.auth.token.email) || null,
+    at: admin.firestore.FieldValue.serverTimestamp(),
+  });
+
+  return {uid, admin: grantAdmin, changed: true};
+});
+
 /** Restore an archived user. */
 const restoreUser = onCall(async (request) => {
   requireAdmin(request);
@@ -293,4 +426,5 @@ module.exports = {
   restoreUser,
   purgeArchivedUsers,
   verifyStaffPin,
+  setUserPrivilege,
 };

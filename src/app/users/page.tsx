@@ -30,6 +30,12 @@ interface AppUser {
   fcmTokenUpdatedAt?: Timestamp;
   onboardingComplete?: boolean;
   status?: "active" | "archived";
+  // Whether this person can log into this admin website. Separate from
+  // account_type on purpose — account_type is "what is their relationship to
+  // the school", this is "can they run the admin site". A copy of the real
+  // switch, which lives on their login (see setUserPrivilege in
+  // functions/user_admin.js) — kept here only so this page can show it.
+  admin?: boolean;
 }
 
 // ─── Account types ──────────────────────────────────────────────────────────
@@ -335,12 +341,54 @@ interface UserModalProps {
   allStudents: AppUser[];
   onSave: (data: UserFormData) => Promise<void>;
   onClose: () => void;
+  // Only set in edit mode — there's nobody to grant access to until the
+  // "Create User" button below has actually made them.
+  targetUser?: AppUser;
+  currentUserId?: string;
+  onSetPrivilege?: (uid: string, grantAdmin: boolean) => Promise<void>;
 }
 
-function UserModal({ mode, initial, allStudents, onSave, onClose }: UserModalProps) {
+function UserModal({
+  mode, initial, allStudents, onSave, onClose,
+  targetUser, currentUserId, onSetPrivilege,
+}: UserModalProps) {
   const [form, setForm] = useState<UserFormData>(initial);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
+
+  // Portal access is its own instant action, not part of the form's Save
+  // Changes — mixing "grant admin" into a bundle with unrelated field edits
+  // would make it easy to change by accident, and hard to tell whether it
+  // actually went through if the rest of the save failed.
+  const [isAdmin, setIsAdmin] = useState(targetUser?.admin === true);
+  const [privilegeStep, setPrivilegeStep] = useState<"idle" | "confirm-grant" | "confirm-revoke">("idle");
+  const [confirmEmailInput, setConfirmEmailInput] = useState("");
+  const [privilegeBusy, setPrivilegeBusy] = useState(false);
+  const [privilegeError, setPrivilegeError] = useState("");
+
+  const isSelf = targetUser != null && targetUser.id === currentUserId;
+  const targetEmail = (targetUser?.email || "").trim().toLowerCase();
+
+  const runPrivilegeChange = async (grantAdmin: boolean) => {
+    if (!targetUser || !onSetPrivilege) return;
+    setPrivilegeBusy(true);
+    setPrivilegeError("");
+    try {
+      await onSetPrivilege(targetUser.id, grantAdmin);
+      setIsAdmin(grantAdmin);
+      setPrivilegeStep("idle");
+      setConfirmEmailInput("");
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : "Could not update access.";
+      setPrivilegeError(
+        msg.includes("No login account")
+          ? "This person doesn't have a login for this site, so they can't be given admin access. Most non-guardian, non-student records are vehicle registrations only, with no login."
+          : msg,
+      );
+    } finally {
+      setPrivilegeBusy(false);
+    }
+  };
 
   const set = (field: keyof UserFormData, value: string | boolean) =>
     setForm((f) => ({ ...f, [field]: value }));
@@ -552,6 +600,143 @@ function UserModal({ mode, initial, allStudents, onSave, onClose }: UserModalPro
             </button>
           </div>
 
+          {/* Portal access — edit mode only, and only once the target user
+              is known, so there's an actual login to point the button at. */}
+          {mode === "edit" && targetUser && (
+            <div className="border border-gray-200 rounded-lg px-4 py-3.5">
+              <p className="text-sm font-medium text-gray-700">Portal access</p>
+              <p className="text-xs text-gray-400 mt-0.5 mb-3">
+                Whether this person can log into this admin website. This is
+                separate from Account Type above — anyone with a login here
+                can be given it.
+              </p>
+
+              {!LOGIN_ROLES.includes(targetUser.account_type) && (
+                <p className="text-xs text-amber-600 bg-amber-50 rounded px-2.5 py-1.5 mb-3">
+                  Heads up: only guardian and student records get a login by
+                  default. If this person doesn&apos;t have one, granting
+                  access below will show an error.
+                </p>
+              )}
+
+              {isSelf ? (
+                <p className="text-xs text-gray-500 bg-gray-50 rounded px-2.5 py-2">
+                  You can&apos;t change your own access here. Ask another
+                  admin to do it.
+                </p>
+              ) : (
+                <>
+                  <div className="flex items-center justify-between">
+                    {isAdmin ? (
+                      <span
+                        className="px-2.5 py-1 rounded-full text-xs font-semibold"
+                        style={roleBadgeStyle("#db2777")}
+                      >
+                        Has admin access
+                      </span>
+                    ) : (
+                      <span className="px-2.5 py-1 rounded-full text-xs font-semibold bg-gray-100 text-gray-500">
+                        No admin access
+                      </span>
+                    )}
+
+                    {privilegeStep === "idle" && (
+                      isAdmin ? (
+                        <button
+                          type="button"
+                          onClick={() => { setPrivilegeStep("confirm-revoke"); setPrivilegeError(""); }}
+                          className="text-xs font-medium text-red-600 hover:text-red-700"
+                        >
+                          Remove admin access
+                        </button>
+                      ) : (
+                        <button
+                          type="button"
+                          onClick={() => { setPrivilegeStep("confirm-grant"); setPrivilegeError(""); }}
+                          className="text-xs font-medium text-blue-600 hover:text-blue-700"
+                        >
+                          Grant admin access
+                        </button>
+                      )
+                    )}
+                  </div>
+
+                  {privilegeStep === "confirm-grant" && (
+                    <div className="mt-3 bg-amber-50 border border-amber-200 rounded-lg p-3">
+                      <p className="text-xs text-amber-800 mb-2">
+                        This gives {targetUser.name || "this person"} full
+                        access to this admin website — every user&apos;s
+                        data, and the power to grant or remove access for
+                        anyone else. Type their email to confirm.
+                      </p>
+                      <input
+                        type="text"
+                        value={confirmEmailInput}
+                        onChange={(e) => setConfirmEmailInput(e.target.value)}
+                        placeholder={targetUser.email || "their email"}
+                        className="w-full px-3 py-2 text-sm border border-amber-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-amber-500 mb-2"
+                      />
+                      <div className="flex justify-end gap-2">
+                        <button
+                          type="button"
+                          onClick={() => { setPrivilegeStep("idle"); setConfirmEmailInput(""); setPrivilegeError(""); }}
+                          className="px-3 py-1.5 text-xs font-medium text-gray-600 hover:text-gray-800"
+                        >
+                          Cancel
+                        </button>
+                        <button
+                          type="button"
+                          disabled={
+                            privilegeBusy ||
+                            !targetEmail ||
+                            confirmEmailInput.trim().toLowerCase() !== targetEmail
+                          }
+                          onClick={() => runPrivilegeChange(true)}
+                          className="px-3 py-1.5 text-xs font-medium bg-amber-600 text-white rounded-lg hover:bg-amber-700 disabled:opacity-40 disabled:cursor-not-allowed transition"
+                        >
+                          {privilegeBusy ? "Granting…" : "Confirm grant"}
+                        </button>
+                      </div>
+                    </div>
+                  )}
+
+                  {privilegeStep === "confirm-revoke" && (
+                    <div className="mt-3 bg-red-50 border border-red-200 rounded-lg p-3">
+                      <p className="text-xs text-red-800 mb-2">
+                        Remove admin access from {targetUser.name || "this person"}?
+                        They&apos;ll lose it as soon as they next reload the
+                        site.
+                      </p>
+                      <div className="flex justify-end gap-2">
+                        <button
+                          type="button"
+                          onClick={() => { setPrivilegeStep("idle"); setPrivilegeError(""); }}
+                          className="px-3 py-1.5 text-xs font-medium text-gray-600 hover:text-gray-800"
+                        >
+                          Cancel
+                        </button>
+                        <button
+                          type="button"
+                          disabled={privilegeBusy}
+                          onClick={() => runPrivilegeChange(false)}
+                          className="px-3 py-1.5 text-xs font-medium bg-red-600 text-white rounded-lg hover:bg-red-700 disabled:opacity-50 transition"
+                        >
+                          {privilegeBusy ? "Removing…" : "Remove access"}
+                        </button>
+                      </div>
+                    </div>
+                  )}
+
+                  {privilegeError && (
+                    <p className="mt-2 text-xs text-red-600 bg-red-50 px-2.5 py-1.5 rounded">
+                      {privilegeError}
+                    </p>
+                  )}
+                </>
+              )}
+            </div>
+          )}
+
           {error && (
             <p className="text-sm text-red-600 bg-red-50 px-3 py-2 rounded-lg">{error}</p>
           )}
@@ -626,6 +811,122 @@ function DeleteConfirmModal({
               <span className="w-3.5 h-3.5 border-2 border-white border-t-transparent rounded-full animate-spin" />
             )}
             Archive
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── Portal Access ("who can log in") Modal ────────────────────────────────
+
+// Every user with admin access, in one place — otherwise the only way to
+// find out is opening each user's edit modal one at a time.
+function AdminAccessModal({
+  admins,
+  currentUserId,
+  onRevoke,
+  onClose,
+}: {
+  admins: AppUser[];
+  currentUserId?: string;
+  onRevoke: (uid: string) => Promise<void>;
+  onClose: () => void;
+}) {
+  const [confirmUid, setConfirmUid] = useState<string | null>(null);
+  const [busyUid, setBusyUid] = useState<string | null>(null);
+  const [error, setError] = useState("");
+
+  const handleRevoke = async (uid: string) => {
+    setBusyUid(uid);
+    setError("");
+    try {
+      await onRevoke(uid);
+      setConfirmUid(null);
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : "Could not remove access.");
+    } finally {
+      setBusyUid(null);
+    }
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-sm">
+      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-lg mx-4 overflow-hidden">
+        <div className="flex items-center justify-between px-6 py-4 border-b border-gray-100">
+          <div>
+            <h2 className="text-lg font-bold text-gray-900">Portal access</h2>
+            <p className="text-xs text-gray-400 mt-0.5">
+              Everyone who can log into this admin website.
+            </p>
+          </div>
+          <button
+            onClick={onClose}
+            className="w-8 h-8 rounded-lg flex items-center justify-center text-gray-400 hover:text-gray-600 hover:bg-gray-100 transition"
+          >
+            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth={2}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
+            </svg>
+          </button>
+        </div>
+
+        <div className="px-6 py-4 max-h-[60vh] overflow-y-auto">
+          {admins.length === 0 ? (
+            <p className="text-sm text-gray-400 text-center py-6">
+              Nobody has admin access. Grant it from a user&apos;s edit screen.
+            </p>
+          ) : (
+            <div className="divide-y divide-gray-100">
+              {admins.map((a) => {
+                const isSelf = a.id === currentUserId;
+                return (
+                  <div key={a.id} className="py-3 flex items-center justify-between gap-3">
+                    <div className="min-w-0">
+                      <p className="text-sm font-medium text-gray-800 truncate">{a.name}</p>
+                      <p className="text-xs text-gray-400 truncate">{a.email || "no email on file"}</p>
+                    </div>
+                    {isSelf ? (
+                      <span className="text-xs text-gray-400 shrink-0">You</span>
+                    ) : confirmUid === a.id ? (
+                      <div className="flex items-center gap-2 shrink-0">
+                        <button
+                          onClick={() => setConfirmUid(null)}
+                          className="text-xs text-gray-500 hover:text-gray-700"
+                        >
+                          Cancel
+                        </button>
+                        <button
+                          onClick={() => handleRevoke(a.id)}
+                          disabled={busyUid === a.id}
+                          className="px-2.5 py-1 text-xs font-medium bg-red-600 text-white rounded-lg hover:bg-red-700 disabled:opacity-50 transition"
+                        >
+                          {busyUid === a.id ? "Removing…" : "Confirm"}
+                        </button>
+                      </div>
+                    ) : (
+                      <button
+                        onClick={() => setConfirmUid(a.id)}
+                        className="text-xs font-medium text-red-600 hover:text-red-700 shrink-0"
+                      >
+                        Remove
+                      </button>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          )}
+          {error && (
+            <p className="mt-3 text-sm text-red-600 bg-red-50 px-3 py-2 rounded-lg">{error}</p>
+          )}
+        </div>
+
+        <div className="flex items-center justify-end gap-3 px-6 py-4 border-t border-gray-100 bg-gray-50">
+          <button
+            onClick={onClose}
+            className="px-4 py-2 text-sm font-medium text-gray-600 hover:text-gray-800 transition"
+          >
+            Close
           </button>
         </div>
       </div>
@@ -1002,6 +1303,7 @@ function UserManagementContent() {
   const [showAdd, setShowAdd] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<AppUser | null>(null);
   const [showImport, setShowImport] = useState(false);
+  const [showAdminAccess, setShowAdminAccess] = useState(false);
 
   useEffect(() => {
     if (!loading && (!user || !isAdmin)) router.push("/login");
@@ -1026,6 +1328,7 @@ function UserManagementContent() {
           onboardingComplete: data.onboardingComplete,
           // Legacy documents predate soft delete and have no status field.
           status: data.status === "archived" ? "archived" : "active",
+          admin: data.admin === true,
         });
       });
       setAllUsers(usersData);
@@ -1093,6 +1396,10 @@ function UserManagementContent() {
     () => allUsers.filter((u) => u.account_type === "student"),
     [allUsers]
   );
+
+  // Read straight off the users we're already subscribed to — no extra
+  // Firestore reads to show who currently has admin access.
+  const admins = useMemo(() => allUsers.filter((u) => u.admin === true), [allUsers]);
 
   const displayUsers = useMemo(() => {
     const q = searchQuery.toLowerCase();
@@ -1239,6 +1546,18 @@ function UserManagementContent() {
     await httpsCallable(functions, "restoreUser")({ uid: u.id });
   };
 
+  // Grant or remove admin access. All the actual guardrails — can't touch
+  // your own access, can't remove the last admin, who-did-this logging — live
+  // server-side in setUserPrivilege, since a browser can't be trusted to
+  // enforce them on itself.
+  const handleSetPrivilege = async (uid: string, grantAdmin: boolean) => {
+    if (!functions) throw new Error("Firebase not initialized");
+    await httpsCallable<
+      { uid: string; admin: boolean },
+      { uid: string; admin: boolean; changed: boolean }
+    >(functions, "setUserPrivilege")({ uid, admin: grantAdmin });
+  };
+
   const handleImport = async (rows: PartitionedRow[]): Promise<ImportResult> => {
     if (!db || !functions) throw new Error("Firebase not initialized");
     const database = db;
@@ -1315,6 +1634,20 @@ function UserManagementContent() {
             </p>
           </div>
           <div className="flex items-center gap-2.5">
+            <button
+              onClick={() => setShowAdminAccess(true)}
+              className="flex items-center gap-2 px-5 py-2.5 bg-white border border-gray-200 text-gray-700 text-sm font-semibold rounded-xl hover:bg-gray-50 transition shadow-sm"
+            >
+              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth={2}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z" />
+              </svg>
+              Portal access
+              {admins.length > 0 && (
+                <span className="w-5 h-5 rounded-full bg-pink-100 text-pink-700 text-xs flex items-center justify-center">
+                  {admins.length}
+                </span>
+              )}
+            </button>
             <button
               onClick={() => setShowImport(true)}
               className="flex items-center gap-2 px-5 py-2.5 bg-white border border-gray-200 text-gray-700 text-sm font-semibold rounded-xl hover:bg-gray-50 transition shadow-sm"
@@ -1765,6 +2098,9 @@ function UserManagementContent() {
           allStudents={allStudents}
           onSave={handleSaveEdit}
           onClose={() => setEditTarget(null)}
+          targetUser={editTarget}
+          currentUserId={user?.uid}
+          onSetPrivilege={handleSetPrivilege}
         />
       )}
 
@@ -1781,6 +2117,15 @@ function UserManagementContent() {
           existingUsers={allUsers}
           onImport={handleImport}
           onClose={() => setShowImport(false)}
+        />
+      )}
+
+      {showAdminAccess && (
+        <AdminAccessModal
+          admins={admins}
+          currentUserId={user?.uid}
+          onRevoke={(uid) => handleSetPrivilege(uid, false)}
+          onClose={() => setShowAdminAccess(false)}
         />
       )}
     </div>

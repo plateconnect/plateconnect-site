@@ -152,6 +152,17 @@ service cloud.firestore {
       allow write: if isAdmin();
     }
 
+    // ─── adminAuditLog ──────────────────────────────────────────────────────
+    // Written only by the setUserPrivilege callable (via the Admin SDK, which
+    // bypasses these rules), one entry per grant/revoke of admin. Readable by
+    // admins so "who granted this and when" has an answer; never client
+    // writable, and never editable once written — an audit log you can edit
+    // isn't one.
+    match /adminAuditLog/{entryId} {
+      allow get, list: if isAdmin();
+      allow write: if false;
+    }
+
     // Deny anything not matched above.
     match /{document=**} {
       allow read, write: if false;

@@ -281,6 +281,7 @@ exports.archiveUser = userAdmin.archiveUser;
 exports.restoreUser = userAdmin.restoreUser;
 exports.purgeArchivedUsers = userAdmin.purgeArchivedUsers;
 exports.verifyStaffPin = userAdmin.verifyStaffPin;
+exports.setUserPrivilege = userAdmin.setUserPrivilege;
 
 // Guardian <-> student links. wardIds is the source of truth; guardianIds is
 // mirrored so rules can authorise ward reads without an extra lookup.
