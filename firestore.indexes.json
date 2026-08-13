@@ -1,0 +1,57 @@
+{
+  "indexes": [
+    {
+      "collectionGroup": "notices",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {"fieldPath": "cleared", "order": "ASCENDING"},
+        {"fieldPath": "owner_id", "order": "ASCENDING"},
+        {"fieldPath": "arrival_time", "order": "DESCENDING"}
+      ]
+    },
+    {
+      "collectionGroup": "notices",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {"fieldPath": "owner_id", "order": "ASCENDING"},
+        {"fieldPath": "arrival_time", "order": "DESCENDING"}
+      ]
+    },
+    {
+      "collectionGroup": "notices",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {"fieldPath": "owner_id", "order": "ASCENDING"},
+        {"fieldPath": "arrival_time", "order": "DESCENDING"},
+        {"fieldPath": "cleared", "order": "DESCENDING"}
+      ]
+    },
+    {
+      "collectionGroup": "notices",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {"fieldPath": "owner_id", "order": "ASCENDING"},
+        {"fieldPath": "cleared", "order": "ASCENDING"}
+      ]
+    },
+    {
+      "collectionGroup": "notices",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {"fieldPath": "owner_id", "order": "ASCENDING"},
+        {"fieldPath": "ward_id", "order": "ASCENDING"},
+        {"fieldPath": "cleared", "order": "ASCENDING"}
+      ]
+    },
+    {
+      "collectionGroup": "notices",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {"fieldPath": "ward_id", "order": "ASCENDING"},
+        {"fieldPath": "cleared", "order": "ASCENDING"},
+        {"fieldPath": "arrival_time", "order": "DESCENDING"}
+      ]
+    }
+  ],
+  "fieldOverrides": []
+}

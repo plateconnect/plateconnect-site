@@ -1,0 +1,160 @@
+rules_version = '2';
+
+// Firestore security rules for plateconnect-18068.
+//
+// Previously these existed only in the Firebase Console — unversioned and
+// unreviewable. Deploy with:  firebase deploy --only firestore:rules
+//
+// Privilege model:
+//   admin  -> Auth CUSTOM CLAIM (request.auth.token.admin), NOT a Firestore
+//             field. The old `users/{uid}.admin` field meant that deleting the
+//             users collection revoked everyone's admin rights and made the
+//             lockout unrecoverable from the app itself. The field is still
+//             mirrored for display, but it is no longer the gate.
+//   staff  -> Auth custom claim, for teachers who need the whole-school view.
+//
+// Grant either with set_claims.py.
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isAdmin() {
+      return isSignedIn() && request.auth.token.admin == true;
+    }
+
+    // Admins are implicitly staff.
+    function isStaff() {
+      return isAdmin() || (isSignedIn() && request.auth.token.staff == true);
+    }
+
+    function isSelf(uid) {
+      return isSignedIn() && request.auth.uid == uid;
+    }
+
+    function userDoc(uid) {
+      return get(/databases/$(database)/documents/users/$(uid)).data;
+    }
+
+    // Fields a user may change on their own profile. Everything else —
+    // account_type, admin, status, wardIds, guardianIds, email, timestamps —
+    // is server- or admin-only, so a client cannot promote itself, re-link a
+    // child, or un-archive an account.
+    function onlySelfEditableFields() {
+      return request.resource.data.diff(resource.data).affectedKeys()
+        .hasOnly([
+          'name', 'grade', 'vehicles', 'licensePlateNumbers',
+          'carDescriptions', 'onboardingComplete', 'updatedAt',
+          'fcmToken', 'fcmTokenUpdatedAt'
+        ]);
+    }
+
+    // ─── users ──────────────────────────────────────────────────────────────
+    match /users/{uid} {
+      // A guardian may read a ward's profile via the mirrored guardianIds
+      // array. Using the field (rather than a get() on the caller's own doc)
+      // keeps this to zero extra reads.
+      allow get: if isSelf(uid)
+                 || isStaff()
+                 || (isSignedIn()
+                     && request.auth.uid in resource.data.get('guardianIds', []));
+
+      // Deliberately staff-only. A broader list rule would let any signed-in
+      // client enumerate every student in the school — the ward-linking search
+      // must go through the linkWardByEmail callable instead.
+      allow list: if isStaff();
+
+      allow create: if isSelf(uid)
+                    && request.resource.data.get('admin', false) == false
+                    && request.resource.data.get('status', 'active') == 'active';
+
+      allow update: if isAdmin()
+                    || (isSelf(uid) && onlySelfEditableFields());
+
+      // Soft delete only (status: 'archived'), so "removing old users" is
+      // always reversible. Hard deletes go through the Admin SDK.
+      allow delete: if false;
+    }
+
+    // ─── notices ────────────────────────────────────────────────────────────
+    match /notices/{noticeId} {
+      allow get, list: if isStaff()
+                       || (isSignedIn()
+                           && (resource.data.owner_id == request.auth.uid
+                               || resource.data.ward_id == request.auth.uid));
+
+      // The "I'm Here!" button creates notices client-side. A guardian may
+      // only create one for themselves, for a ward they actually have, and
+      // may not pre-mark it cleared.
+      allow create: if isSignedIn()
+                    && request.resource.data.owner_id == request.auth.uid
+                    && request.resource.data.cleared == false
+                    && request.resource.data.ward_id
+                       in userDoc(request.auth.uid).get('wardIds', []);
+
+      // Staff may toggle `cleared` and `left_school` (the dashboard's
+      // "left school" control). A guardian or the student concerned may only
+      // clear their own notice — never re-point it at someone else by editing
+      // owner_id, ward_id, or the plate.
+      allow update: if isSignedIn() && (
+        (isStaff()
+         && request.resource.data.diff(resource.data)
+            .affectedKeys().hasOnly(['cleared', 'left_school']))
+        ||
+        ((resource.data.owner_id == request.auth.uid
+          || resource.data.ward_id == request.auth.uid)
+         && request.resource.data.diff(resource.data)
+            .affectedKeys().hasOnly(['cleared']))
+      );
+
+      allow delete: if false;
+    }
+
+    // ─── arrivals ───────────────────────────────────────────────────────────
+    // Append-only log written by the detection pipeline via the Admin SDK
+    // (which bypasses these rules). No client writes, ever.
+    match /arrivals/{arrivalId} {
+      allow get, list: if isStaff();
+      allow write: if false;
+    }
+
+    // ─── plates ─────────────────────────────────────────────────────────────
+    // Plate -> guardian index. Maintained solely by the syncPlateIndex trigger
+    // and backfill_plates.py. Readable by staff for debugging; never client
+    // writable, since a forged entry would redirect someone else's pickup
+    // notification.
+    match /plates/{plate} {
+      allow get, list: if isStaff();
+      allow write: if false;
+    }
+
+    // ─── pins ───────────────────────────────────────────────────────────────
+    // ⚠️ `pins/rootPin` is a shared plaintext PIN. Any client that can read it
+    // can impersonate a teacher, so reads are admin-only here.
+    //
+    // THIS BREAKS the current PIN teacher flow (account_chooser.dart reads the
+    // doc directly and compares client-side). Before deploying, migrate to the
+    // verifyStaffPin callable, which compares server-side and never returns
+    // the PIN. See MOBILE_APP_CHANGES.md.
+    match /pins/{pinId} {
+      allow read, write: if isAdmin();
+    }
+
+    // ─── settings ───────────────────────────────────────────────────────────
+    // Admin-console display preferences, e.g. settings/roleColors. Stored
+    // centrally rather than per-browser so every admin sees the same scheme.
+    // Readable by staff (the console renders with it), writable by admins only.
+    match /settings/{settingId} {
+      allow get, list: if isStaff();
+      allow write: if isAdmin();
+    }
+
+    // Deny anything not matched above.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
