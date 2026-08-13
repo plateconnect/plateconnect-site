@@ -639,10 +639,7 @@ function UserModal({
             <div className="border border-gray-200 rounded-lg px-4 py-3.5">
               <p className="text-sm font-medium text-gray-700">Portal access</p>
               <p className="text-xs text-gray-400 mt-0.5 mb-3">
-                Whether this person can log into this admin website. This is
-                separate from Account Type above, and from whether they use
-                the pickup app — if they don&apos;t already have a login,
-                granting access creates one and emails them a link to set a
+                Login access to this admin website. Emails a link to set a
                 password.
               </p>
 
@@ -692,11 +689,10 @@ function UserModal({
                     <div className="mt-3 bg-amber-50 border border-amber-200 rounded-lg p-3">
                       <p className="text-xs text-amber-800 mb-2">
                         This gives {targetUser.name || "this person"} full
-                        access to this admin website — every user&apos;s
-                        data, and the power to grant or remove access for
-                        anyone else.{" "}
+                        access to this admin website and the power to grant
+                        or remove access for anyone else.{" "}
                         {targetUser.email
-                          ? "They'll be emailed a link to set a password if they don't already have a login."
+                          ? "They will receive an email with a link to set a password if they don't already have a login."
                           : "This record has no email on file, so a login can't be created for them — add one first."}
                         {" "}Type their email to confirm.
                       </p>
@@ -771,7 +767,8 @@ function UserModal({
                   )}
                   {emailState === "sent" && (
                     <p className="mt-2 text-xs text-green-700 bg-green-50 px-2.5 py-1.5 rounded">
-                      Access granted. A setup email was sent to {targetUser.email}.
+                      Email has been sent. Check spam if you don&apos;t see
+                      an email.
                     </p>
                   )}
                   {emailState === "not-needed" && (
