@@ -3,7 +3,7 @@
 import { useState, useEffect, useMemo, Suspense } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { useAuth } from "@/context/AuthContext";
-import { db, functions } from "@/lib/firebase";
+import { auth, db, functions } from "@/lib/firebase";
 import {
   collection,
   onSnapshot,
@@ -15,6 +15,7 @@ import {
   setDoc,
 } from "firebase/firestore";
 import { httpsCallable } from "firebase/functions";
+import { sendPasswordResetEmail } from "firebase/auth";
 import Sidebar from "@/components/Sidebar";
 import GradeBadge from "@/components/GradeBadge";
 
@@ -345,8 +346,15 @@ interface UserModalProps {
   // "Create User" button below has actually made them.
   targetUser?: AppUser;
   currentUserId?: string;
-  onSetPrivilege?: (uid: string, grantAdmin: boolean) => Promise<void>;
+  onSetPrivilege?: (
+    uid: string,
+    grantAdmin: boolean,
+  ) => Promise<{ accountCreated: boolean }>;
 }
+
+// Result of the most recent grant, so the modal can tell the admin whether a
+// login was created and an email actually went out — not just "success".
+type EmailState = "idle" | "sending" | "sent" | "not-needed" | "error";
 
 function UserModal({
   mode, initial, allStudents, onSave, onClose,
@@ -365,26 +373,51 @@ function UserModal({
   const [confirmEmailInput, setConfirmEmailInput] = useState("");
   const [privilegeBusy, setPrivilegeBusy] = useState(false);
   const [privilegeError, setPrivilegeError] = useState("");
+  const [emailState, setEmailState] = useState<EmailState>("idle");
+  const [emailError, setEmailError] = useState("");
 
   const isSelf = targetUser != null && targetUser.id === currentUserId;
   const targetEmail = (targetUser?.email || "").trim().toLowerCase();
+
+  // Fires Firebase's own built-in "set your password" email. There's no
+  // separate email service in this project — this is the same mechanism
+  // every "forgot password" flow uses, and it works whether or not a
+  // password already existed, so it doubles as "here's how to claim this
+  // new login" with zero extra setup.
+  const sendSetupEmail = async () => {
+    if (!targetEmail || !auth) return;
+    setEmailState("sending");
+    setEmailError("");
+    try {
+      await sendPasswordResetEmail(auth, targetEmail);
+      setEmailState("sent");
+    } catch (e: unknown) {
+      setEmailState("error");
+      setEmailError(e instanceof Error ? e.message : "Could not send the setup email.");
+    }
+  };
 
   const runPrivilegeChange = async (grantAdmin: boolean) => {
     if (!targetUser || !onSetPrivilege) return;
     setPrivilegeBusy(true);
     setPrivilegeError("");
+    setEmailState("idle");
+    setEmailError("");
     try {
-      await onSetPrivilege(targetUser.id, grantAdmin);
+      const result = await onSetPrivilege(targetUser.id, grantAdmin);
       setIsAdmin(grantAdmin);
       setPrivilegeStep("idle");
       setConfirmEmailInput("");
+
+      if (grantAdmin) {
+        if (result.accountCreated) {
+          await sendSetupEmail();
+        } else {
+          setEmailState("not-needed");
+        }
+      }
     } catch (e: unknown) {
-      const msg = e instanceof Error ? e.message : "Could not update access.";
-      setPrivilegeError(
-        msg.includes("No login account")
-          ? "This person doesn't have a login for this site, so they can't be given admin access. Most non-guardian, non-student records are vehicle registrations only, with no login."
-          : msg,
-      );
+      setPrivilegeError(e instanceof Error ? e.message : "Could not update access.");
     } finally {
       setPrivilegeBusy(false);
     }
@@ -601,23 +634,17 @@ function UserModal({
           </div>
 
           {/* Portal access — edit mode only, and only once the target user
-              is known, so there's an actual login to point the button at. */}
+              is known, so there's an actual record to point the button at. */}
           {mode === "edit" && targetUser && (
             <div className="border border-gray-200 rounded-lg px-4 py-3.5">
               <p className="text-sm font-medium text-gray-700">Portal access</p>
               <p className="text-xs text-gray-400 mt-0.5 mb-3">
                 Whether this person can log into this admin website. This is
-                separate from Account Type above — anyone with a login here
-                can be given it.
+                separate from Account Type above, and from whether they use
+                the pickup app — if they don&apos;t already have a login,
+                granting access creates one and emails them a link to set a
+                password.
               </p>
-
-              {!LOGIN_ROLES.includes(targetUser.account_type) && (
-                <p className="text-xs text-amber-600 bg-amber-50 rounded px-2.5 py-1.5 mb-3">
-                  Heads up: only guardian and student records get a login by
-                  default. If this person doesn&apos;t have one, granting
-                  access below will show an error.
-                </p>
-              )}
 
               {isSelf ? (
                 <p className="text-xs text-gray-500 bg-gray-50 rounded px-2.5 py-2">
@@ -667,7 +694,11 @@ function UserModal({
                         This gives {targetUser.name || "this person"} full
                         access to this admin website — every user&apos;s
                         data, and the power to grant or remove access for
-                        anyone else. Type their email to confirm.
+                        anyone else.{" "}
+                        {targetUser.email
+                          ? "They'll be emailed a link to set a password if they don't already have a login."
+                          : "This record has no email on file, so a login can't be created for them — add one first."}
+                        {" "}Type their email to confirm.
                       </p>
                       <input
                         type="text"
@@ -731,6 +762,38 @@ function UserModal({
                     <p className="mt-2 text-xs text-red-600 bg-red-50 px-2.5 py-1.5 rounded">
                       {privilegeError}
                     </p>
+                  )}
+
+                  {emailState === "sending" && (
+                    <p className="mt-2 text-xs text-gray-500">
+                      Sending the setup email…
+                    </p>
+                  )}
+                  {emailState === "sent" && (
+                    <p className="mt-2 text-xs text-green-700 bg-green-50 px-2.5 py-1.5 rounded">
+                      Access granted. A setup email was sent to {targetUser.email}.
+                    </p>
+                  )}
+                  {emailState === "not-needed" && (
+                    <p className="mt-2 text-xs text-gray-500 bg-gray-50 px-2.5 py-1.5 rounded">
+                      Access granted. They already had a login for this site,
+                      so no new email was needed.
+                    </p>
+                  )}
+                  {emailState === "error" && (
+                    <div className="mt-2 text-xs text-red-600 bg-red-50 px-2.5 py-1.5 rounded">
+                      <p>
+                        Access was granted, but the setup email failed to
+                        send: {emailError}
+                      </p>
+                      <button
+                        type="button"
+                        onClick={sendSetupEmail}
+                        className="mt-1 font-medium text-red-700 hover:text-red-800 underline"
+                      >
+                        Try sending it again
+                      </button>
+                    </div>
                   )}
                 </>
               )}
@@ -1552,10 +1615,11 @@ function UserManagementContent() {
   // enforce them on itself.
   const handleSetPrivilege = async (uid: string, grantAdmin: boolean) => {
     if (!functions) throw new Error("Firebase not initialized");
-    await httpsCallable<
+    const result = await httpsCallable<
       { uid: string; admin: boolean },
-      { uid: string; admin: boolean; changed: boolean }
+      { uid: string; admin: boolean; changed: boolean; accountCreated: boolean }
     >(functions, "setUserPrivilege")({ uid, admin: grantAdmin });
+    return result.data;
   };
 
   const handleImport = async (rows: PartitionedRow[]): Promise<ImportResult> => {
@@ -2124,7 +2188,7 @@ function UserManagementContent() {
         <AdminAccessModal
           admins={admins}
           currentUserId={user?.uid}
-          onRevoke={(uid) => handleSetPrivilege(uid, false)}
+          onRevoke={async (uid) => { await handleSetPrivilege(uid, false); }}
           onClose={() => setShowAdminAccess(false)}
         />
       )}

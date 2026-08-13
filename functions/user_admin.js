@@ -225,7 +225,19 @@ async function countAdmins({excludeUid} = {}) {
 
 /**
  * Grant or revoke the admin claim for a user. The in-website equivalent of
- * `set_claims.py --grant admin` / `--revoke admin`.
+ * `set_claims.py --grant admin` / `--revoke admin`, extended so it never
+ * depends on the person already having a login for the mobile app.
+ *
+ * There is only one login system behind this whole project (Firebase Auth) —
+ * the mobile app and this website share it. But granting admin access should
+ * not be blocked on someone having used the mobile app first: most non-
+ * guardian, non-student rows (teachers, faculty, vehicle-only records) have
+ * no Auth account at all, since createUserAccount only makes one for roles
+ * that sign in. So if the users/{uid} document being granted access has no
+ * matching Auth account yet, one is created here — keyed by that SAME
+ * document id, so nothing else that reads doc(db,'users',uid) has to change
+ * — and the person is emailed a link to set a password. No password is ever
+ * set or shared by this function itself.
  *
  * set_claims.py leaves three things to the operator's judgment that this
  * callable enforces instead, since it will be used by less technical staff
@@ -265,25 +277,76 @@ const setUserPrivilege = onCall(async (request) => {
     );
   }
 
+  const userDocRef = admin.firestore().collection("users").doc(uid);
+  const userDoc = await userDocRef.get();
+  if (!userDoc.exists) {
+    throw new HttpsError("not-found", `No user record for ${uid}`);
+  }
+  const userData = userDoc.data() || {};
+
   let targetUser;
   try {
     targetUser = await admin.auth().getUser(uid);
   } catch (e) {
-    if (e.code === "auth/user-not-found") {
+    if (e.code !== "auth/user-not-found") throw e;
+    targetUser = null;
+  }
+
+  let accountCreated = false;
+
+  if (!targetUser) {
+    if (!grantAdmin) {
+      // Nothing to revoke — they've never had a login, so they've never
+      // held the claim either.
+      return {uid, admin: false, changed: false, accountCreated: false};
+    }
+
+    if (!userData.email) {
       throw new HttpsError(
-          "not-found",
-          `No login account for uid ${uid}. Admin access requires one — ` +
-          "this user may only be a vehicle registration.",
+          "failed-precondition",
+          "This person has no email on file, so a login can't be created " +
+          "for them. Add an email first.",
       );
     }
-    throw e;
+
+    // A login for this email might already exist under a DIFFERENT uid —
+    // most likely this person has a second, duplicate record. Creating a
+    // second Auth account for the same email would silently split them
+    // into two separate logins, so refuse rather than guess which one to
+    // use.
+    let emailInUseByUid = null;
+    try {
+      const byEmail = await admin.auth().getUserByEmail(userData.email);
+      emailInUseByUid = byEmail.uid;
+    } catch (e) {
+      if (e.code !== "auth/user-not-found") throw e;
+    }
+    if (emailInUseByUid) {
+      throw new HttpsError(
+          "failed-precondition",
+          `${userData.email} already has a login, on a different record ` +
+          `(uid ${emailInUseByUid}). Grant access on that record instead, ` +
+          "or fix the duplicate first.",
+      );
+    }
+
+    targetUser = await admin.auth().createUser({
+      uid,
+      email: userData.email,
+      displayName: userData.name || undefined,
+      // No password: the account is claimed through the email sent after
+      // this returns, so no shared secret is ever transmitted or stored.
+      password: require("crypto").randomBytes(32).toString("hex"),
+      emailVerified: false,
+    });
+    accountCreated = true;
   }
 
   const wasAdmin = Boolean(
       targetUser.customClaims && targetUser.customClaims.admin === true,
   );
   if (wasAdmin === grantAdmin) {
-    return {uid, admin: grantAdmin, changed: false};
+    return {uid, admin: grantAdmin, changed: false, accountCreated};
   }
 
   if (!grantAdmin) {
@@ -307,7 +370,7 @@ const setUserPrivilege = onCall(async (request) => {
 
   // Mirror for the admin-list UI — the same field set_claims.py maintains.
   // Not the gate; security rules and AuthContext read the claim, not this.
-  await admin.firestore().collection("users").doc(uid).set({
+  await userDocRef.set({
     admin: grantAdmin,
     updatedAt: admin.firestore.FieldValue.serverTimestamp(),
   }, {merge: true});
@@ -319,13 +382,19 @@ const setUserPrivilege = onCall(async (request) => {
   await admin.firestore().collection("adminAuditLog").add({
     action: grantAdmin ? "grant_admin" : "revoke_admin",
     targetUid: uid,
-    targetEmail: targetUser.email || null,
+    targetEmail: userData.email || null,
+    accountCreated,
     actorUid: callerUid,
     actorEmail: (request.auth.token && request.auth.token.email) || null,
     at: admin.firestore.FieldValue.serverTimestamp(),
   });
 
-  return {uid, admin: grantAdmin, changed: true};
+  // The setup email itself is sent by the website right after this
+  // resolves, using Firebase Auth's own built-in "reset password" email —
+  // there's no email-sending service in this project to send a custom one
+  // from here, and that built-in flow is exactly "click this link to set a
+  // password" regardless of whether one existed before.
+  return {uid, admin: grantAdmin, changed: true, accountCreated};
 });
 
 /** Restore an archived user. */
