@@ -8,19 +8,17 @@ import { auth, db } from "@/lib/firebase";
 interface AuthContextType {
   user: User | null;
   isAdmin: boolean;
-  isStaff: boolean;
   loading: boolean;
 }
 
 const AuthContext = createContext<AuthContextType>({
   user: null,
   isAdmin: false,
-  isStaff: false,
   loading: true,
 });
 
 /**
- * Resolve admin/staff from the Auth CUSTOM CLAIM rather than users/{uid}.admin.
+ * Resolve admin from the Auth CUSTOM CLAIM rather than users/{uid}.admin.
  *
  * The Firestore field was the single point of failure behind the Aug 2026
  * lockout: deleting the users collection revoked every admin, and repairing it
@@ -32,23 +30,24 @@ const AuthContext = createContext<AuthContextType>({
  * whose claim has not been granted yet. Security rules prevent a user from
  * writing `admin` to their own document, so the fallback cannot be abused.
  * Remove it once every admin has a claim.
+ *
+ * Only `admin` is read here. The `staff` claim still exists and still matters
+ * — firestore.rules isStaff() gates arrivals, notices, plates and settings for
+ * the Flutter teacher view — but this site is admin-only, so it never granted
+ * access to any page here. Grant either claim with set_claims.py (in the
+ * platecap repo).
  */
-async function resolvePrivileges(
-  currentUser: User,
-): Promise<{ isAdmin: boolean; isStaff: boolean }> {
+async function resolveIsAdmin(currentUser: User): Promise<boolean> {
   let token = await currentUser.getIdTokenResult();
 
   // A claim granted after this token was minted won't appear until refresh.
   // Only pay for a forced refresh when the claim is missing.
-  if (token.claims.admin !== true && token.claims.staff !== true) {
+  if (token.claims.admin !== true) {
     token = await currentUser.getIdTokenResult(true);
   }
 
   if (token.claims.admin === true) {
-    return { isAdmin: true, isStaff: true };
-  }
-  if (token.claims.staff === true) {
-    return { isAdmin: false, isStaff: true };
+    return true;
   }
 
   // Transitional fallback.
@@ -60,20 +59,19 @@ async function resolvePrivileges(
           `[auth] ${currentUser.uid} is admin via the legacy Firestore field ` +
             `but has no custom claim. Grant one with set_claims.py.`,
         );
-        return { isAdmin: true, isStaff: true };
+        return true;
       }
     } catch {
       // Rules may deny the read; fall through to no privileges.
     }
   }
 
-  return { isAdmin: false, isStaff: false };
+  return false;
 }
 
 export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [user, setUser] = useState<User | null>(null);
   const [isAdmin, setIsAdmin] = useState(false);
-  const [isStaff, setIsStaff] = useState(false);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
@@ -90,16 +88,15 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       if (!currentUser) {
         if (!cancelled) {
           setIsAdmin(false);
-          setIsStaff(false);
           setUser(null);
           setLoading(false);
         }
         return;
       }
 
-      let privileges = { isAdmin: false, isStaff: false };
+      let admin = false;
       try {
-        privileges = await resolvePrivileges(currentUser);
+        admin = await resolveIsAdmin(currentUser);
       } catch (err) {
         console.error("[auth] could not resolve privileges", err);
       }
@@ -107,8 +104,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       // Guard against a second auth event landing while this one was awaiting.
       if (cancelled) return;
 
-      setIsAdmin(privileges.isAdmin);
-      setIsStaff(privileges.isStaff);
+      setIsAdmin(admin);
       setUser(currentUser);
       setLoading(false);
     });
@@ -120,7 +116,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   return (
-    <AuthContext.Provider value={{ user, isAdmin, isStaff, loading }}>
+    <AuthContext.Provider value={{ user, isAdmin, loading }}>
       {children}
     </AuthContext.Provider>
   );
