@@ -127,7 +127,49 @@ function groupArrivals(raw: Notice[]): Notice[] {
     result.push(...pendingArrivals);
   }
 
-  return result.sort((a, b) => b.arrival_time.toMillis() - a.arrival_time.toMillis());
+  return result.sort((a, b) => latestEventMillis(b) - latestEventMillis(a));
+}
+
+/**
+ * When a row last had activity — its departure if it has one, else its arrival.
+ *
+ * A merged row keeps the *arrival's* timestamp, so sorting on `arrival_time`
+ * filed a car that had just driven out under the time it drove in that morning.
+ * A car seen leaving at 15:30 that arrived at 08:00 landed hundreds of rows
+ * down, nowhere near the top where you would look for it right after watching
+ * it happen.
+ *
+ * Sort key only. `arrival_time` stays the displayed timestamp, and the
+ * date/stat filters still bucket a visit by when it started.
+ */
+function latestEventMillis(n: Notice): number {
+  const arrival = n.arrival_time.toMillis();
+  const departure = n.departure_time?.toMillis();
+  return departure !== undefined && departure > arrival ? departure : arrival;
+}
+
+/** Every location a row touches — the entrance it came in by, the exit it left by, or both. */
+function locationsOf(n: Notice): string[] {
+  const out: string[] = [];
+  if (n.entrance_location) out.push(n.entrance_location);
+  if (n.departure_location && n.departure_location !== n.entrance_location) {
+    out.push(n.departure_location);
+  }
+  return out;
+}
+
+/**
+ * Which status filters a row answers to.
+ *
+ * A merged row is stamped `status: "left"` but represents a car that arrived
+ * *and* left, so it belongs in both buckets. Matching the bare field meant the
+ * "Arrived" filter hid every car that had since driven out — i.e. almost all
+ * of them by the end of a day.
+ */
+function statusesOf(n: Notice): string[] {
+  const status = (n.status || "").toLowerCase();
+  if (n.departure_time) return ["arrived", "left"];
+  return status ? [status] : [];
 }
 
 type ExportScope = "current-filter" | "today" | "this-week" | "all";
@@ -208,11 +250,35 @@ const PERSON_TYPE_OPTIONS = [
 const PAGE_SIZE_OPTIONS = [10, 20, 50, 100, 200];
 const DEFAULT_PAGE_SIZE = 50;
 
-const LOCATION_OPTIONS = [
-  { value: "main entrance", label: "Main Entrance" },
-  { value: "side entrance", label: "Side Entrance" },
-  { value: "N/A", label: "N/A" },
-];
+/** Rows with no location at all get this pseudo-option. */
+const NO_LOCATION = "N/A";
+
+/**
+ * Build the location filter from the locations actually present.
+ *
+ * This was a hardcoded ["main entrance", "side entrance", "N/A"] and the
+ * cameras are called "axis ms exit", "axis ms entrance1", "axis ms loop",
+ * "hs entrance" and "hs exit" — so every option matched nothing and any
+ * selection emptied the table. Deriving it means renaming a camera in PlateCap
+ * can never silently break the filter again.
+ *
+ * Departure locations are included, otherwise the exits — which is where the
+ * folded half of a merged row lives — would still be unselectable.
+ */
+function locationOptions(rows: Notice[]): { value: string; label: string }[] {
+  const seen = new Set<string>();
+  let hasBlank = false;
+  for (const n of rows) {
+    const locs = locationsOf(n);
+    if (locs.length === 0) hasBlank = true;
+    for (const loc of locs) seen.add(loc);
+  }
+  const options = [...seen]
+    .sort((a, b) => a.localeCompare(b))
+    .map((value) => ({ value, label: value }));
+  if (hasBlank) options.push({ value: NO_LOCATION, label: NO_LOCATION });
+  return options;
+}
 
 const PERSON_TYPE_STYLES: Record<string, { bg: string; text: string; dot: string }> = {
   student:  { bg: "bg-blue-50",   text: "text-blue-700",   dot: "bg-blue-400" },
@@ -536,7 +602,20 @@ export default function AdminDashboardPage() {
     };
   }, [user]);
 
-  const groupedNotices = useMemo(() => groupArrivals(notices), [notices]);
+  // The toggle has to gate the grouping itself, not just the layout.
+  //
+  // This used to call groupArrivals() unconditionally and only switch which
+  // table body rendered. The flat layout draws entrance_location and image_url
+  // only, so every folded pair showed the *entrance's* name, timestamp and
+  // photo while the departure half was never drawn at all — turning "group
+  // pairs" off, the obvious way to ask for one row per detection, was itself
+  // what made exit detections disappear. Exits are the only ones that can be
+  // affected: groupArrivals always consumes the `left` document, and only exit
+  // cameras emit that status.
+  const groupedNotices = useMemo(
+    () => (groupPairs ? groupArrivals(notices) : notices),
+    [notices, groupPairs],
+  );
 
   const stats = useMemo(() => {
     const todayKey = zonedDayKey(new Date());
@@ -597,12 +676,19 @@ export default function AdminDashboardPage() {
       });
     }
     if (startTime || endTime) {
-      filtered = filtered.filter((n) => {
-        const t = zonedTimeKey(n.arrival_time.toDate());
+      // Either end of a visit counts. Keying on the arrival alone dropped a
+      // car that left inside the window but drove in hours before it.
+      const inWindow = (d: Date) => {
+        const t = zonedTimeKey(d);
         if (startTime && t < startTime) return false;
         if (endTime && t > endTime) return false;
         return true;
-      });
+      };
+      filtered = filtered.filter(
+        (n) =>
+          inWindow(n.arrival_time.toDate()) ||
+          (n.departure_time ? inWindow(n.departure_time.toDate()) : false),
+      );
     }
     if (selectedPersonTypes.length > 0) {
       filtered = filtered.filter((n) =>
@@ -610,22 +696,35 @@ export default function AdminDashboardPage() {
       );
     }
     if (selectedLocations.length > 0) {
+      // Match the exit as well as the entrance. A merged row carries its exit
+      // in departure_location, so checking entrance_location alone hid every
+      // paired car from a filter on the exit it actually drove through.
+      const wanted = new Set(selectedLocations.map((s) => s.toLowerCase()));
       filtered = filtered.filter((n) => {
-        const loc = (n.entrance_location || "N/A").toLowerCase();
-        return selectedLocations.some(
-          (sel) => sel.toLowerCase() === loc || (sel === "N/A" && !n.entrance_location)
-        );
+        const locs = locationsOf(n);
+        if (locs.length === 0) return wanted.has(NO_LOCATION.toLowerCase());
+        return locs.some((loc) => wanted.has(loc.toLowerCase()));
       });
     }
-    if (statusFilter === "arrived") filtered = filtered.filter((n) => (n.status || "").toLowerCase() === "arrived");
-    else if (statusFilter === "left") filtered = filtered.filter((n) => (n.status || "").toLowerCase() === "left");
-    else if (statusFilter === "not-set") filtered = filtered.filter((n) => !["arrived", "left"].includes((n.status || "").toLowerCase()));
+    if (statusFilter === "arrived" || statusFilter === "left") {
+      filtered = filtered.filter((n) => statusesOf(n).includes(statusFilter));
+    } else if (statusFilter === "not-set") {
+      filtered = filtered.filter((n) => statusesOf(n).length === 0);
+    }
     return filtered;
     // userMap matters: the person-type filter resolves through it, so the list
     // has to recompute once the user directory arrives.
   }, [groupedNotices, searchQuery, startDate, endDate, startTime, endTime, selectedLocations, selectedPersonTypes, statusFilter, userMap]);
 
   const personOf = (n: Notice) => personFor(n, userMap);
+
+  // Derived from the loaded rows, not the filtered ones — otherwise selecting
+  // one location would drop every other option out of the list and you could
+  // never widen the selection again.
+  const locationFilterOptions = useMemo(
+    () => locationOptions(groupedNotices),
+    [groupedNotices],
+  );
 
   // More documents exist than are currently loaded.
   const remainingArrivals =
@@ -913,7 +1012,7 @@ export default function AdminDashboardPage() {
                 <div className="border-t border-gray-100 my-4" />
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
                   <MultiSelectPills label="Person Type" options={PERSON_TYPE_OPTIONS} selected={selectedPersonTypes} onChange={setSelectedPersonTypes} />
-                  <MultiSelectPills label="Detection Location" options={LOCATION_OPTIONS} selected={selectedLocations} onChange={setSelectedLocations} />
+                  <MultiSelectPills label="Detection Location" options={locationFilterOptions} selected={selectedLocations} onChange={setSelectedLocations} />
                 </div>
                 <div className="border-t border-gray-100 my-4" />
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
