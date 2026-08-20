@@ -9,8 +9,10 @@ import {
   query,
   orderBy,
   onSnapshot,
+  getDocs,
   Timestamp,
   limit,
+  where,
   getCountFromServer,
 } from "firebase/firestore";
 import Sidebar from "@/components/Sidebar";
@@ -18,17 +20,30 @@ import {
   APP_TIME_ZONE,
   zonedDayKey,
   zonedTimeKey,
+  shiftDayKey,
+  dayKeyStart,
   currentWeekStartKey,
   formatDateShort,
   formatTimeShort,
   formatElapsed,
 } from "@/lib/appTime";
 
-// `arrivals` is append-only and grows ~990 documents a day, so reading all of
-// it on every page view gets steadily more expensive forever. Load a couple of
-// days by default and let the user pull more on demand.
-const ARRIVALS_INITIAL_ROWS = 2000;
-const ARRIVALS_PAGE_ROWS = 4000;
+// `arrivals` is append-only and grows a couple of thousand documents a day, so
+// reading all of it on every page view gets steadily more expensive forever.
+// The window is measured in DAYS, not rows.
+//
+// It was a 2000-row cap, chosen when the log grew ~990/day. Volume has since
+// roughly doubled, so that cap silently shrank from "about two days" to about
+// ten hours — and because it is a row count, nothing on screen said so. A day
+// boundary cannot drift like that: one day of traffic is one day of traffic
+// however busy the day gets.
+const ARRIVALS_INITIAL_DAYS = 1;
+
+// Backstop only, so a runaway day (a camera stuck in a detection loop) cannot
+// bill an unbounded read. Roughly a week of normal traffic. If it is ever hit
+// the UI says so rather than quietly truncating — that failure mode is what
+// made the old cap look like missing data.
+const ARRIVALS_SAFETY_CAP = 20000;
 
 interface Notice {
   id: string;
@@ -502,7 +517,10 @@ export default function AdminDashboardPage() {
 
   // How many arrival documents to pull. Raised by "Load older", so the cost of
   // reading history is paid only when someone actually asks for it.
-  const [rowLimit, setRowLimit] = useState(ARRIVALS_INITIAL_ROWS);
+  const [daysLoaded, setDaysLoaded] = useState(ARRIVALS_INITIAL_DAYS);
+  // null until the anchor query lands; the table waits rather than
+  // querying from a guessed boundary and then re-querying.
+  const [anchorDayKey, setAnchorDayKey] = useState<string | null>(null);
   const [totalArrivals, setTotalArrivals] = useState<number | null>(null);
   const [userMap, setUserMap] = useState<Map<string, PersonInfo>>(new Map());
 
@@ -527,19 +545,69 @@ export default function AdminDashboardPage() {
     return () => clearInterval(id);
   }, []);
 
+  // Anchor the window on the most recent arrival rather than on the wall
+  // clock.
+  //
+  // "The last day" has to mean the last day with traffic. The cameras do not
+  // run overnight, at weekends, or over a break, so anchoring on today would
+  // routinely open an empty table — which reads as a broken dashboard, and is
+  // precisely the "looks like data loss" failure the row cap already caused
+  // once. One extra document read, on mount.
+  //
+  // Only the START of the range is anchored; the range has no upper bound, so
+  // the live listener still picks up arrivals as they happen.
   useEffect(() => {
     if (!user || !db) return;
-    // Bounded on purpose. This used to be an unbounded onSnapshot over the
-    // whole `arrivals` collection, so every visit read all 12,700+ documents,
-    // and the cost grew with the log forever (~990 new arrivals a day).
+    let cancelled = false;
+    getDocs(query(collection(db, "arrivals"), orderBy("arrival_time", "desc"), limit(1)))
+      .then((snap) => {
+        if (cancelled) return;
+        const newest = snap.docs[0]?.data().arrival_time as Timestamp | undefined;
+        setAnchorDayKey(newest ? zonedDayKey(newest.toDate()) : zonedDayKey(new Date()));
+      })
+      .catch(() => {
+        if (!cancelled) setAnchorDayKey(zonedDayKey(new Date()));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [user]);
+
+  /** First day the live query covers. `daysLoaded === 1` means the anchor day only. */
+  const windowStartKey = useMemo(
+    () => (anchorDayKey ? shiftDayKey(anchorDayKey, -(daysLoaded - 1)) : null),
+    [anchorDayKey, daysLoaded],
+  );
+
+  /**
+   * Where the Firestore query actually starts.
+   *
+   * A date filter reaching further back than the loaded window has to widen
+   * the *query*, not just sift what is already in memory — that mismatch is
+   * why picking an earlier date used to return an empty table rather than
+   * that day's rows.
+   */
+  const queryStartKey = useMemo(() => {
+    if (!windowStartKey) return null;
+    return startDate && startDate < windowStartKey ? startDate : windowStartKey;
+  }, [startDate, windowStartKey]);
+
+  useEffect(() => {
+    if (!user || !db || !queryStartKey) return;
+    // Bounded by DATE, server side. This used to be an unbounded onSnapshot
+    // over the whole collection, then a 2000-row cap; both failed the same way
+    // in the end, by hiding rows without saying which.
     //
-    // Paginated rather than fixed: a hard cap silently hid older rows, which
-    // looked like data loss. The user now controls how far back to load, so
-    // history is always reachable and the reads are only spent when asked for.
+    // A range on arrival_time plus an orderBy on the same field needs only the
+    // automatic single-field index, so this costs no composite index. It also
+    // means the date filter genuinely re-queries instead of sifting whatever
+    // happened to be loaded — picking a day outside the window used to return
+    // nothing at all.
     const q = query(
       collection(db, "arrivals"),
+      where("arrival_time", ">=", Timestamp.fromDate(dayKeyStart(queryStartKey))),
       orderBy("arrival_time", "desc"),
-      limit(rowLimit),
+      limit(ARRIVALS_SAFETY_CAP),
     );
     const unsubscribe = onSnapshot(q, (snapshot) => {
       const noticesData: Notice[] = [];
@@ -563,7 +631,7 @@ export default function AdminDashboardPage() {
       setLastSyncTime(new Date());
     });
     return () => unsubscribe();
-  }, [user, rowLimit]);
+  }, [user, queryStartKey]);
 
   // Live user directory for resolving names and roles on arrivals. ~105
   // documents against 2000 arrivals, so a ~5% read increase, and it keeps the
@@ -730,6 +798,27 @@ export default function AdminDashboardPage() {
   const remainingArrivals =
     totalArrivals !== null ? Math.max(0, totalArrivals - notices.length) : 0;
 
+  /** Human label for the loaded window, e.g. "Today" or "15–17 Aug". */
+  const windowLabel = useMemo(() => {
+    if (!queryStartKey || !anchorDayKey) return "Loading…";
+    const todayKey = zonedDayKey(new Date());
+    const from = formatDateShort(dayKeyStart(queryStartKey));
+    if (queryStartKey === anchorDayKey) {
+      // Naming the date when it is not today is the point: an empty table on a
+      // Sunday should say "latest day 17 Aug", not look broken.
+      return anchorDayKey === todayKey ? "Today" : `Latest day · ${from}`;
+    }
+    const span = Math.round(
+      (dayKeyStart(anchorDayKey).getTime() - dayKeyStart(queryStartKey).getTime()) / 86_400_000,
+    );
+    return `${span + 1} days, from ${from}`;
+  }, [queryStartKey, anchorDayKey]);
+
+  // The safety cap was reached, so this window is truncated after all. Say so
+  // explicitly — an unannounced cap is indistinguishable from missing data,
+  // which is the exact trap the old 2000-row limit fell into.
+  const windowTruncated = notices.length >= ARRIVALS_SAFETY_CAP;
+
   const totalPages = Math.max(1, Math.ceil(filteredNotices.length / pageSize));
   const pagedNotices = filteredNotices.slice((currentPage - 1) * pageSize, currentPage * pageSize);
 
@@ -871,16 +960,28 @@ export default function AdminDashboardPage() {
                 // the same unit — the gap is the merged pairs.
                 sub: (
                   <div className="mt-2 space-y-2">
+                    {/* Name the window, not just a row count. The old card said
+                        "2,000 of 21,965" — a true statement that told you
+                        nothing about whether the car you were looking for was
+                        even in range. */}
+                    <div className="text-xs font-medium text-gray-500">{windowLabel}</div>
                     <div className="text-xs text-gray-400">
-                      out of {totalArrivals !== null ? totalArrivals.toLocaleString() : "…"} total records
+                      {notices.length.toLocaleString()} records in view
+                      {totalArrivals !== null && ` · ${totalArrivals.toLocaleString()} all time`}
                     </div>
+                    {windowTruncated && (
+                      <div className="text-xs font-medium text-amber-600">
+                        Capped at {ARRIVALS_SAFETY_CAP.toLocaleString()} — older rows in
+                        this range are not shown.
+                      </div>
+                    )}
                     {remainingArrivals > 0 && (
                       <button
                         type="button"
-                        onClick={() => setRowLimit((n) => n + ARRIVALS_PAGE_ROWS)}
+                        onClick={() => setDaysLoaded((d) => d + 1)}
                         className="px-2.5 py-1 rounded-lg text-xs font-medium text-blue-600 border border-blue-200 hover:bg-blue-50 transition"
                       >
-                        Load {Math.min(ARRIVALS_PAGE_ROWS, remainingArrivals).toLocaleString()} more
+                        Load previous day
                       </button>
                     )}
                   </div>

@@ -89,3 +89,44 @@ export function currentZoneAbbreviation(at: Date = new Date()) {
       .find((p) => p.type === "timeZoneName")?.value ?? ""
   );
 }
+
+const OFFSET_FMT = new Intl.DateTimeFormat("en-CA", {
+  timeZone: APP_TIME_ZONE,
+  year: "numeric",
+  month: "2-digit",
+  day: "2-digit",
+  hour: "2-digit",
+  minute: "2-digit",
+  second: "2-digit",
+  hourCycle: "h23",
+});
+
+/** How far the school's wall clock is behind UTC at `at`, in ms (EDT → +4h). */
+function zoneOffsetMs(at: Date) {
+  const p = partsOf(OFFSET_FMT, at);
+  const asUtc = Date.UTC(
+    Number(p.year),
+    Number(p.month) - 1,
+    Number(p.day),
+    Number(p.hour),
+    Number(p.minute),
+    Number(p.second),
+  );
+  return at.getTime() - asUtc;
+}
+
+/**
+ * The instant a day key begins in school time — midnight, not UTC midnight.
+ *
+ * Needed to turn a "YYYY-MM-DD" into a Firestore range bound. Resolved in two
+ * passes because the zone's offset depends on the instant you ask about, and
+ * on a DST changeover the offset at UTC midnight is not the offset at local
+ * midnight; the second pass re-reads it at the corrected instant.
+ */
+export function dayKeyStart(key: string): Date {
+  const [y, m, d] = key.split("-").map(Number);
+  const wall = Date.UTC(y, m - 1, d, 0, 0, 0);
+  let instant = new Date(wall + zoneOffsetMs(new Date(wall)));
+  instant = new Date(wall + zoneOffsetMs(instant));
+  return instant;
+}
