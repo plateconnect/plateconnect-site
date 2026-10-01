@@ -178,7 +178,7 @@ function statusesOf(n: Notice): string[] {
 }
 
 type ExportScope = "current-filter" | "today" | "this-week" | "all";
-type ExportFormat = "csv-sheets" | "csv-excel" | "txt";
+type ExportFormat = "csv-sheets" | "csv-excel" | "xlsx" | "json" | "txt";
 
 const EXPORT_FORMATS: Record<
   ExportFormat,
@@ -199,6 +199,22 @@ const EXPORT_FORMATS: Record<
     mime: "text/csv",
     delimiter: ",",
     bom: true,
+  },
+  xlsx: {
+    label: "XLSX (Excel workbook)",
+    description: "Native Excel file. No encoding issues, with a frozen header row and column widths.",
+    ext: "xlsx",
+    mime: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    delimiter: "",
+    bom: false,
+  },
+  json: {
+    label: "JSON",
+    description: "Array of records keyed by column name, for scripts and other systems.",
+    ext: "json",
+    mime: "application/json",
+    delimiter: "",
+    bom: false,
   },
   txt: {
     label: "TXT",
@@ -254,7 +270,7 @@ function statusLabel(status?: string) {
   return "Not set";
 }
 
-function exportRows(
+async function exportRows(
   rows: Notice[],
   scope: ExportScope,
   format: ExportFormat,
@@ -276,7 +292,7 @@ function exportRows(
     "Departure Image URL",
     "Elapsed",
   ];
-  const lines = rows.map((n) => {
+  const records: string[][] = rows.map((n) => {
     const arrival = n.arrival_time.toDate();
     const departure = n.departure_time?.toDate();
     const person = personFor(n, users);
@@ -294,25 +310,53 @@ function exportRows(
       departure ? n.departure_location ?? "" : "",
       departure ? n.departure_image_url ?? "" : "",
       departure ? formatElapsed(arrival.getTime(), departure.getTime()) : "",
-    ]
-      .map((v) =>
-        fmt.delimiter === ","
-          ? `"${String(v).replace(/"/g, '""')}"`
-          : String(v).replace(/[\t\r\n]+/g, " "),
-      )
-      .join(fmt.delimiter);
+    ].map(String);
   });
-  const text = [headers.join(fmt.delimiter), ...lines].join("\n");
-  // Excel on Windows assumes ANSI (Windows-1252) unless the file starts with a
-  // UTF-8 BOM, which turns "\u2014" into "\u00e2\u20ac\u201d". Google Sheets does not need it.
-  const blob = new Blob([fmt.bom ? "\uFEFF" + text : text], {
-    type: `${fmt.mime};charset=utf-8;`,
-  });
+
+  let blob: Blob;
+  if (format === "xlsx") {
+    // Loaded on demand: exceljs is large and only needed for this format.
+    const ExcelJS = (await import("exceljs")).default;
+    const wb = new ExcelJS.Workbook();
+    const ws = wb.addWorksheet("Notices", { views: [{ state: "frozen", ySplit: 1 }] });
+    ws.columns = headers.map((h, i) => ({
+      header: h,
+      key: String(i),
+      width: Math.min(
+        50,
+        Math.max(h.length + 2, ...records.slice(0, 500).map((r) => r[i].length + 2)),
+      ),
+    }));
+    ws.getRow(1).font = { bold: true };
+    // Plain strings: keeps plates like "0123" and locale-formatted dates as shown.
+    records.forEach((r) => ws.addRow(r));
+    const buf = await wb.xlsx.writeBuffer();
+    blob = new Blob([buf], { type: fmt.mime });
+  } else if (format === "json") {
+    const objects = records.map((r) => Object.fromEntries(headers.map((h, i) => [h, r[i]])));
+    blob = new Blob([JSON.stringify(objects, null, 2)], { type: `${fmt.mime};charset=utf-8;` });
+  } else {
+    const lines = records.map((r) =>
+      r
+        .map((v) =>
+          fmt.delimiter === ","
+            ? `"${v.replace(/"/g, '""')}"`
+            : v.replace(/[\t\r\n]+/g, " "),
+        )
+        .join(fmt.delimiter),
+    );
+    const text = [headers.join(fmt.delimiter), ...lines].join("\n");
+    // Excel on Windows assumes ANSI (Windows-1252) unless the file starts with a
+    // UTF-8 BOM, which turns "\u2014" into "\u00e2\u20ac\u201d". Google Sheets does not need it.
+    blob = new Blob([fmt.bom ? "\uFEFF" + text : text], {
+      type: `${fmt.mime};charset=utf-8;`,
+    });
+  }
+
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url;
-  const scopeLabel = scope === "current-filter" ? "current-filter" : scope === "today" ? "today" : scope === "this-week" ? "this-week" : "all";
-  a.download = `notices-${scopeLabel}-${zonedDayKey(new Date())}.${fmt.ext}`;
+  a.download = `notices-${scope}-${zonedDayKey(new Date())}.${fmt.ext}`;
   a.click();
   URL.revokeObjectURL(url);
 }
@@ -869,7 +913,7 @@ export default function AdminDashboardPage() {
     setExporting(true);
     setExportError(null);
     try {
-      exportRows(await getExportRows(exportScope), exportScope, exportFormat, userMap);
+      await exportRows(await getExportRows(exportScope), exportScope, exportFormat, userMap);
       setExportModalOpen(false);
     } catch (err) {
       setExportError(err instanceof Error ? err.message : "Export failed.");
