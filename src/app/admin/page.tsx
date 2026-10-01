@@ -17,6 +17,7 @@ import {
   where,
   type QueryConstraint,
   type DocumentData,
+  type QueryDocumentSnapshot,
 } from "firebase/firestore";
 import Sidebar from "@/components/Sidebar";
 import {
@@ -242,23 +243,34 @@ function docToNotice(id: string, data: DocumentData): Notice {
   };
 }
 
-/** Read arrivals (newest first) in pages, optionally only those at or after `since`. */
-async function fetchArrivals(since?: Date): Promise<Notice[]> {
+/**
+ * Read arrivals (newest first) in pages, optionally only those at or after
+ * `since`. `onPage` receives each page as it arrives so callers can show
+ * progress. The cursor is the last document, not its timestamp: several
+ * arrivals can share a timestamp, and a timestamp cursor would skip any that
+ * straddle a page boundary.
+ */
+async function fetchArrivals(
+  since?: Date,
+  onPage?: (page: Notice[]) => void,
+): Promise<Notice[]> {
   if (!db) return [];
   const PAGE = 5000;
   const out: Notice[] = [];
   const base: QueryConstraint[] = [];
   if (since) base.push(where("arrival_time", ">=", Timestamp.fromDate(since)));
   base.push(orderBy("arrival_time", "desc"));
-  let cursor: Timestamp | undefined;
+  let cursor: QueryDocumentSnapshot | undefined;
   for (;;) {
     const constraints = [...base];
     if (cursor) constraints.push(startAfter(cursor));
     constraints.push(limit(PAGE));
     const snap = await getDocs(query(collection(db, "arrivals"), ...constraints));
-    snap.forEach((d) => out.push(docToNotice(d.id, d.data())));
+    const page = snap.docs.map((d) => docToNotice(d.id, d.data()));
+    out.push(...page);
+    onPage?.(page);
     if (snap.size < PAGE) break;
-    cursor = out[out.length - 1].arrival_time;
+    cursor = snap.docs[snap.docs.length - 1];
   }
   return out;
 }
@@ -619,7 +631,12 @@ function MultiSelectPills({
 export default function AdminDashboardPage() {
   const { user, isAdmin, loading } = useAuth();
   const router = useRouter();
-  const [notices, setNotices] = useState<Notice[]>([]);
+  // `liveNotices` is the real-time window (newest `rowLimit` rows). "Load all"
+  // pages the rest in separately as `bulkNotices`; `notices` is the merge.
+  const [liveNotices, setLiveNotices] = useState<Notice[]>([]);
+  const [bulkNotices, setBulkNotices] = useState<Notice[]>([]);
+  const [bulkLoading, setBulkLoading] = useState(false);
+  const [bulkError, setBulkError] = useState<string | null>(null);
   const [lastSyncTime, setLastSyncTime] = useState<Date | null>(null);
   const [now, setNow] = useState(() => new Date());
   const [filtersOpen, setFiltersOpen] = useState(false);
@@ -671,14 +688,14 @@ export default function AdminDashboardPage() {
       orderBy("arrival_time", "desc"),
       limit(rowLimit),
     );
-    const unsubscribe = onSnapshot(q, (snapshot) => {
-      const noticesData: Notice[] = [];
-      snapshot.forEach((doc) => {
-        noticesData.push(docToNotice(doc.id, doc.data()));
-      });
-      setNotices(noticesData);
-      setLastSyncTime(new Date());
-    });
+    const unsubscribe = onSnapshot(
+      q,
+      (snapshot) => {
+        setLiveNotices(snapshot.docs.map((doc) => docToNotice(doc.id, doc.data())));
+        setLastSyncTime(new Date());
+      },
+      (err) => console.error("arrivals listener failed", err),
+    );
     return () => unsubscribe();
   }, [user, rowLimit]);
 
@@ -718,6 +735,17 @@ export default function AdminDashboardPage() {
       cancelled = true;
     };
   }, [user]);
+
+  const notices = useMemo(() => {
+    if (bulkNotices.length === 0) return liveNotices;
+    // Live rows win over the bulk copy of the same document.
+    const byId = new Map<string, Notice>();
+    for (const n of bulkNotices) byId.set(n.id, n);
+    for (const n of liveNotices) byId.set(n.id, n);
+    return [...byId.values()].sort(
+      (a, b) => b.arrival_time.toMillis() - a.arrival_time.toMillis(),
+    );
+  }, [liveNotices, bulkNotices]);
 
   // The toggle has to gate the grouping itself, not just the layout.
   //
@@ -922,8 +950,8 @@ export default function AdminDashboardPage() {
     }
   };
 
-  const loadAll = () => {
-    if (totalArrivals === null) return;
+  const loadAll = async () => {
+    if (totalArrivals === null || bulkLoading) return;
     if (
       totalArrivals > 20_000 &&
       !window.confirm(
@@ -932,8 +960,18 @@ export default function AdminDashboardPage() {
     ) {
       return;
     }
-    // Headroom for arrivals that land while the listener is open.
-    setRowLimit(totalArrivals + 1000);
+    setBulkLoading(true);
+    setBulkError(null);
+    setBulkNotices([]);
+    try {
+      // Appended page by page so the Loaded count climbs while it works.
+      await fetchArrivals(undefined, (page) => setBulkNotices((prev) => [...prev, ...page]));
+    } catch (err) {
+      console.error("load all failed", err);
+      setBulkError(err instanceof Error ? err.message : "Could not load all records.");
+    } finally {
+      setBulkLoading(false);
+    }
   };
 
   const exportOptions = [
@@ -1027,7 +1065,16 @@ export default function AdminDashboardPage() {
                     <div className="text-xs text-gray-400">
                       out of {totalArrivals !== null ? totalArrivals.toLocaleString() : "…"} total records
                     </div>
-                    {remainingArrivals > 0 && (
+                    {bulkLoading && (
+                      <div className="text-xs text-blue-600">
+                        Loading all records… {notices.length.toLocaleString()} of{" "}
+                        {totalArrivals !== null ? totalArrivals.toLocaleString() : "…"}
+                      </div>
+                    )}
+                    {bulkError && (
+                      <div className="text-xs text-red-600">Load all failed: {bulkError}</div>
+                    )}
+                    {remainingArrivals > 0 && !bulkLoading && (
                       <button
                         type="button"
                         onClick={() => setRowLimit((n) => n + ARRIVALS_PAGE_ROWS)}
@@ -1036,7 +1083,7 @@ export default function AdminDashboardPage() {
                         Load {Math.min(ARRIVALS_PAGE_ROWS, remainingArrivals).toLocaleString()} more
                       </button>
                     )}
-                    {remainingArrivals > 0 && (
+                    {remainingArrivals > 0 && !bulkLoading && (
                       <button
                         type="button"
                         onClick={loadAll}
