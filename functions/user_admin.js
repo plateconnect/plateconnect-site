@@ -205,9 +205,10 @@ const archiveUser = onCall(async (request) => {
  * that decides whether an action is allowed should not trust a copy that
  * something else could in principle have gotten out of sync — it should
  * check the thing that actually grants access.
- * @param {{excludeUid?: string}} opts uid to leave out of the count, so a
+ * @param {Object} [opts] Options.
+ * @param {string} [opts.excludeUid] uid to leave out of the count, so a
  *   revoke can ask "how many admins remain besides the one being revoked".
- * @return {Promise<number>}
+ * @return {Promise<number>} Number of admins.
  */
 async function countAdmins({excludeUid} = {}) {
   let count = 0;
