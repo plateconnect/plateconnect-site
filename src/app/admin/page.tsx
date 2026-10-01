@@ -12,6 +12,11 @@ import {
   Timestamp,
   limit,
   getCountFromServer,
+  getDocs,
+  startAfter,
+  where,
+  type QueryConstraint,
+  type DocumentData,
 } from "firebase/firestore";
 import Sidebar from "@/components/Sidebar";
 import {
@@ -173,6 +178,74 @@ function statusesOf(n: Notice): string[] {
 }
 
 type ExportScope = "current-filter" | "today" | "this-week" | "all";
+type ExportFormat = "csv-sheets" | "csv-excel" | "txt";
+
+const EXPORT_FORMATS: Record<
+  ExportFormat,
+  { label: string; description: string; ext: string; mime: string; delimiter: string; bom: boolean }
+> = {
+  "csv-sheets": {
+    label: "CSV (for Google Sheets)",
+    description: "Comma-separated, plain UTF-8.",
+    ext: "csv",
+    mime: "text/csv",
+    delimiter: ",",
+    bom: false,
+  },
+  "csv-excel": {
+    label: "CSV (for Excel)",
+    description: "Comma-separated, UTF-8 with BOM so Excel on Windows shows symbols like \u201C\u2014\u201D correctly.",
+    ext: "csv",
+    mime: "text/csv",
+    delimiter: ",",
+    bom: true,
+  },
+  txt: {
+    label: "TXT",
+    description: "Tab-separated plain text, UTF-8.",
+    ext: "txt",
+    mime: "text/plain",
+    delimiter: "\t",
+    bom: false,
+  },
+};
+
+function docToNotice(id: string, data: DocumentData): Notice {
+  return {
+    id,
+    arrival_time: data.arrival_time,
+    ward_names: data.ward_names || [],
+    owner_id: data.owner_id,
+    license_plate: data.licensePlate,
+    image_url: data.image_url,
+    ward_ids: data.ward_ids,
+    person_type: data.person_type,
+    person_name: data.person_name,
+    entrance_location: data.entrance_location,
+    status: data.status,
+  };
+}
+
+/** Read arrivals (newest first) in pages, optionally only those at or after `since`. */
+async function fetchArrivals(since?: Date): Promise<Notice[]> {
+  if (!db) return [];
+  const PAGE = 5000;
+  const out: Notice[] = [];
+  const base: QueryConstraint[] = [];
+  if (since) base.push(where("arrival_time", ">=", Timestamp.fromDate(since)));
+  base.push(orderBy("arrival_time", "desc"));
+  let cursor: Timestamp | undefined;
+  for (;;) {
+    const constraints = [...base];
+    if (cursor) constraints.push(startAfter(cursor));
+    constraints.push(limit(PAGE));
+    const snap = await getDocs(query(collection(db, "arrivals"), ...constraints));
+    snap.forEach((d) => out.push(docToNotice(d.id, d.data())));
+    if (snap.size < PAGE) break;
+    cursor = out[out.length - 1].arrival_time;
+  }
+  return out;
+}
 
 function statusLabel(status?: string) {
   const key = (status || "").toLowerCase();
@@ -181,11 +254,13 @@ function statusLabel(status?: string) {
   return "Not set";
 }
 
-function exportToCsv(
+function exportRows(
   rows: Notice[],
   scope: ExportScope,
+  format: ExportFormat,
   users: Map<string, PersonInfo>,
 ) {
+  const fmt = EXPORT_FORMATS[format];
   const headers = [
     "Type",
     "Name",
@@ -220,16 +295,24 @@ function exportToCsv(
       departure ? n.departure_image_url ?? "" : "",
       departure ? formatElapsed(arrival.getTime(), departure.getTime()) : "",
     ]
-      .map((v) => `"${String(v).replace(/"/g, '""')}"`)
-      .join(",");
+      .map((v) =>
+        fmt.delimiter === ","
+          ? `"${String(v).replace(/"/g, '""')}"`
+          : String(v).replace(/[\t\r\n]+/g, " "),
+      )
+      .join(fmt.delimiter);
   });
-  const csv = [headers.join(","), ...lines].join("\n");
-  const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+  const text = [headers.join(fmt.delimiter), ...lines].join("\n");
+  // Excel on Windows assumes ANSI (Windows-1252) unless the file starts with a
+  // UTF-8 BOM, which turns "\u2014" into "\u00e2\u20ac\u201d". Google Sheets does not need it.
+  const blob = new Blob([fmt.bom ? "\uFEFF" + text : text], {
+    type: `${fmt.mime};charset=utf-8;`,
+  });
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url;
   const scopeLabel = scope === "current-filter" ? "current-filter" : scope === "today" ? "today" : scope === "this-week" ? "this-week" : "all";
-  a.download = `notices-${scopeLabel}-${zonedDayKey(new Date())}.csv`;
+  a.download = `notices-${scopeLabel}-${zonedDayKey(new Date())}.${fmt.ext}`;
   a.click();
   URL.revokeObjectURL(url);
 }
@@ -517,6 +600,9 @@ export default function AdminDashboardPage() {
   const [groupPairs, setGroupPairs] = useState(true);
   const [exportModalOpen, setExportModalOpen] = useState(false);
   const [exportScope, setExportScope] = useState<ExportScope>("current-filter");
+  const [exportFormat, setExportFormat] = useState<ExportFormat>("csv-excel");
+  const [exporting, setExporting] = useState(false);
+  const [exportError, setExportError] = useState<string | null>(null);
 
   useEffect(() => {
     if (!loading && (!user || !isAdmin)) router.push("/login");
@@ -544,20 +630,7 @@ export default function AdminDashboardPage() {
     const unsubscribe = onSnapshot(q, (snapshot) => {
       const noticesData: Notice[] = [];
       snapshot.forEach((doc) => {
-        const data = doc.data();
-        noticesData.push({
-          id: doc.id,
-          arrival_time: data.arrival_time,
-          ward_names: data.ward_names || [],
-          owner_id: data.owner_id,
-          license_plate: data.licensePlate,
-          image_url: data.image_url,
-          ward_ids: data.ward_ids,
-          person_type: data.person_type,
-          person_name: data.person_name,
-          entrance_location: data.entrance_location,
-          status: data.status,
-        });
+        noticesData.push(docToNotice(doc.id, doc.data()));
       });
       setNotices(noticesData);
       setLastSyncTime(new Date());
@@ -762,25 +835,61 @@ export default function AdminDashboardPage() {
     setPageSize(DEFAULT_PAGE_SIZE);
   };
 
-  const getExportRows = (scope: ExportScope) => {
+  // Everything is loaded when the listener has caught up with the total count.
+  const allLoaded = totalArrivals !== null && notices.length >= totalArrivals;
+
+  /**
+   * Rows to export. "Current filter" can only see what is loaded. The other
+   * scopes fetch whatever the loaded window does not cover, so "Everything"
+   * really is everything rather than just the rows currently on screen.
+   */
+  const getExportRows = async (scope: ExportScope): Promise<Notice[]> => {
     if (scope === "current-filter") return filteredNotices;
 
-    if (scope === "today") {
-      const todayKey = zonedDayKey(new Date());
-      return groupedNotices.filter((n) => zonedDayKey(n.arrival_time.toDate()) === todayKey);
+    const dayKeyOf = (n: Notice) => zonedDayKey(n.arrival_time.toDate());
+    const group = (raw: Notice[]) => (groupPairs ? groupArrivals(raw) : raw);
+
+    if (scope === "all") {
+      return allLoaded ? groupedNotices : group(await fetchArrivals());
     }
 
-    if (scope === "this-week") {
-      const weekStartKey = currentWeekStartKey();
-      return groupedNotices.filter((n) => zonedDayKey(n.arrival_time.toDate()) >= weekStartKey);
-    }
-
-    return groupedNotices;
+    // today / this-week: reuse the loaded rows if they reach back far enough.
+    // The lookback is generous so the zone offset and an arrival/departure pair
+    // straddling the boundary are still included.
+    const days = scope === "today" ? 2 : 8;
+    const since = new Date(Date.now() - days * 86_400_000);
+    const oldest = notices.length ? notices[notices.length - 1].arrival_time.toDate() : null;
+    const covered = allLoaded || (oldest !== null && oldest <= since);
+    const grouped = covered ? groupedNotices : group(await fetchArrivals(since));
+    const startKey = scope === "today" ? zonedDayKey(new Date()) : currentWeekStartKey();
+    return grouped.filter((n) => dayKeyOf(n) >= startKey);
   };
 
-  const handleExport = () => {
-    exportToCsv(getExportRows(exportScope), exportScope, userMap);
-    setExportModalOpen(false);
+  const handleExport = async () => {
+    setExporting(true);
+    setExportError(null);
+    try {
+      exportRows(await getExportRows(exportScope), exportScope, exportFormat, userMap);
+      setExportModalOpen(false);
+    } catch (err) {
+      setExportError(err instanceof Error ? err.message : "Export failed.");
+    } finally {
+      setExporting(false);
+    }
+  };
+
+  const loadAll = () => {
+    if (totalArrivals === null) return;
+    if (
+      totalArrivals > 20_000 &&
+      !window.confirm(
+        `Load all ${totalArrivals.toLocaleString()} records? This reads every document (billed Firestore reads) and may take a while.`,
+      )
+    ) {
+      return;
+    }
+    // Headroom for arrivals that land while the listener is open.
+    setRowLimit(totalArrivals + 1000);
   };
 
   const exportOptions = [
@@ -881,6 +990,15 @@ export default function AdminDashboardPage() {
                         className="px-2.5 py-1 rounded-lg text-xs font-medium text-blue-600 border border-blue-200 hover:bg-blue-50 transition"
                       >
                         Load {Math.min(ARRIVALS_PAGE_ROWS, remainingArrivals).toLocaleString()} more
+                      </button>
+                    )}
+                    {remainingArrivals > 0 && (
+                      <button
+                        type="button"
+                        onClick={loadAll}
+                        className="ml-2 px-2.5 py-1 rounded-lg text-xs font-medium text-white bg-blue-600 hover:bg-blue-700 transition"
+                      >
+                        Load all ({remainingArrivals.toLocaleString()})
                       </button>
                     )}
                   </div>
@@ -1217,7 +1335,7 @@ export default function AdminDashboardPage() {
           <div className="w-full max-w-md rounded-2xl border border-gray-200 bg-white shadow-xl">
             <div className="border-b border-gray-100 px-5 py-4">
               <h2 className="text-lg font-semibold text-gray-900">Export notices</h2>
-              <p className="mt-1 text-sm text-gray-500">Choose what you want to export.</p>
+              <p className="mt-1 text-sm text-gray-500">Choose what and in which format to export.</p>
             </div>
 
             <div className="space-y-2 px-5 py-4">
@@ -1243,20 +1361,67 @@ export default function AdminDashboardPage() {
                   </label>
                 );
               })}
+
+              {exportScope === "current-filter" && !allLoaded && (
+                <p className="text-xs text-amber-600">
+                  Only the {notices.length.toLocaleString()} loaded records are searched. Load all records first, or pick
+                  &ldquo;Everything&rdquo;, to include older ones.
+                </p>
+              )}
+              {exportScope === "all" && !allLoaded && (
+                <p className="text-xs text-gray-500">
+                  Fetches every record from the database
+                  {totalArrivals !== null ? ` (${totalArrivals.toLocaleString()})` : ""}. This may take a moment and
+                  counts as Firestore reads.
+                </p>
+              )}
+
+              <div className="pt-3">
+                <h3 className="mb-2 text-sm font-semibold text-gray-900">File type</h3>
+                <div className="space-y-2">
+                  {(Object.keys(EXPORT_FORMATS) as ExportFormat[]).map((key) => {
+                    const f = EXPORT_FORMATS[key];
+                    const checked = exportFormat === key;
+                    return (
+                      <label
+                        key={key}
+                        className={`flex cursor-pointer items-start gap-3 rounded-xl border px-3 py-3 transition ${checked ? "border-blue-200 bg-blue-50" : "border-gray-200 bg-white hover:bg-gray-50"}`}
+                      >
+                        <input
+                          type="radio"
+                          name="export-format"
+                          value={key}
+                          checked={checked}
+                          onChange={() => setExportFormat(key)}
+                          className="mt-0.5 h-4 w-4 border-gray-300 text-blue-600 focus:ring-blue-500"
+                        />
+                        <div>
+                          <div className="text-sm font-medium text-gray-900">{f.label}</div>
+                          <div className="mt-0.5 text-xs text-gray-500">{f.description}</div>
+                        </div>
+                      </label>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {exportError && <p className="text-xs text-red-600">{exportError}</p>}
             </div>
 
             <div className="flex justify-end gap-2 border-t border-gray-100 px-5 py-4">
               <button
                 onClick={() => setExportModalOpen(false)}
+                disabled={exporting}
                 className="rounded-lg border border-gray-200 px-4 py-2 text-sm font-medium text-gray-600 transition hover:bg-gray-50"
               >
                 Cancel
               </button>
               <button
                 onClick={handleExport}
-                className="rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white transition hover:bg-blue-700"
+                disabled={exporting}
+                className="rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white transition hover:bg-blue-700 disabled:opacity-60"
               >
-                Export
+                {exporting ? "Exporting…" : "Export"}
               </button>
             </div>
           </div>
