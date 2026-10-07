@@ -18,6 +18,8 @@ const eslintConfig = [
       "out/**",
       "build/**",
       "next-env.d.ts",
+      // Cloud Functions are CommonJS and have their own ESLint config.
+      "functions/**",
     ],
   },
 ];
