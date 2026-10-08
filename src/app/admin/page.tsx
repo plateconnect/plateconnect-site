@@ -26,6 +26,7 @@ import {
   zonedTimeKey,
   currentWeekStartKey,
   zonedDayStart,
+  shiftDayKey,
   formatDateShort,
   formatTimeShort,
   formatElapsed,
@@ -38,7 +39,6 @@ import {
 // The live listener stays at this size: Firestore rejects a listener whose
 // limit() exceeds 10,000, so anything older is paged in with getDocs instead.
 const ARRIVALS_INITIAL_ROWS = 2000;
-const ARRIVALS_PAGE_ROWS = 4000;
 
 interface Notice {
   id: string;
@@ -662,6 +662,12 @@ export default function AdminDashboardPage() {
 
   // Where the next "Load more" continues from: the oldest document loaded so
   // far, whether by the live listener or by an earlier page-in.
+  // "Load" menu on the Loaded card. Counts are fetched when the menu opens, not
+  // on page load, since each is a handful of billed reads.
+  const LOAD_RANGE_DAYS = [7, 14, 30] as const;
+  const [loadMenuOpen, setLoadMenuOpen] = useState(false);
+  const [rangeCounts, setRangeCounts] = useState<Record<number, number | null>>({});
+  const rangeCountsAt = useRef(0);
   const cursorRef = useRef<QueryDocumentSnapshot | undefined>(undefined);
   const pagedRef = useRef(false);
   const [totalArrivals, setTotalArrivals] = useState<number | null>(null);
@@ -1040,18 +1046,49 @@ export default function AdminDashboardPage() {
     void loadOlder(undefined, zonedDayStart(weekStartKey));
   };
 
-  const loadAll = () => {
-    if (totalArrivals === null) return;
+  /** Start of the day `days` days before today, in school time. */
+  const rangeStart = (days: number) =>
+    zonedDayStart(shiftDayKey(zonedDayKey(new Date()), -days));
+
+  const openLoadMenu = () => {
+    const opening = !loadMenuOpen;
+    setLoadMenuOpen(opening);
+    if (!opening || !db || Date.now() - rangeCountsAt.current < 5 * 60_000) return;
+    rangeCountsAt.current = Date.now();
+    const firestore = db;
+    for (const days of LOAD_RANGE_DAYS) {
+      getCountFromServer(
+        query(
+          collection(firestore, "arrivals"),
+          where("arrival_time", ">=", Timestamp.fromDate(rangeStart(days))),
+        ),
+      )
+        .then((snap) => setRangeCounts((prev) => ({ ...prev, [days]: snap.data().count })))
+        .catch(() => setRangeCounts((prev) => ({ ...prev, [days]: null })));
+    }
+  };
+
+  /** Load the past `days` days, or everything when `days` is null. */
+  const loadRange = (days: number | null) => {
+    const count = days === null ? totalArrivals : rangeCounts[days];
     if (
-      totalArrivals > 20_000 &&
+      count != null &&
+      count > 20_000 &&
       !window.confirm(
-        `Load all ${totalArrivals.toLocaleString()} records? This reads every document (billed Firestore reads) and may take a while.`,
+        `Load ${count.toLocaleString()} records? This reads every one (billed Firestore reads) and may take a while.`,
       )
     ) {
       return;
     }
-    void loadOlder();
+    setLoadMenuOpen(false);
+    void loadOlder(undefined, days === null ? undefined : rangeStart(days));
   };
+
+  const oldestLoadedMs = notices.length
+    ? notices[notices.length - 1].arrival_time.toMillis()
+    : null;
+  const rangeLoaded = (days: number) =>
+    allLoaded || (oldestLoadedMs !== null && oldestLoadedMs <= rangeStart(days).getTime());
 
   const exportOptions = [
     {
@@ -1151,25 +1188,60 @@ export default function AdminDashboardPage() {
                       </div>
                     )}
                     {bulkError && (
-                      <div className="text-xs text-red-600">Load all failed: {bulkError}</div>
+                      <div className="text-xs text-red-600">Load failed: {bulkError}</div>
                     )}
                     {remainingArrivals > 0 && !bulkLoading && (
-                      <button
-                        type="button"
-                        onClick={() => void loadOlder(ARRIVALS_PAGE_ROWS)}
-                        className="px-2.5 py-1 rounded-lg text-xs font-medium text-blue-600 border border-blue-200 hover:bg-blue-50 transition"
-                      >
-                        Load {Math.min(ARRIVALS_PAGE_ROWS, remainingArrivals).toLocaleString()} more
-                      </button>
-                    )}
-                    {remainingArrivals > 0 && !bulkLoading && (
-                      <button
-                        type="button"
-                        onClick={loadAll}
-                        className="ml-2 px-2.5 py-1 rounded-lg text-xs font-medium text-white bg-blue-600 hover:bg-blue-700 transition"
-                      >
-                        Load all ({remainingArrivals.toLocaleString()})
-                      </button>
+                      <div className="relative">
+                        <button
+                          type="button"
+                          onClick={openLoadMenu}
+                          aria-haspopup="menu"
+                          aria-expanded={loadMenuOpen}
+                          className="px-2.5 py-1 rounded-lg text-xs font-medium text-white bg-blue-600 hover:bg-blue-700 transition"
+                        >
+                          Load records &#9662;
+                        </button>
+                        {loadMenuOpen && (
+                          <>
+                            <button
+                              type="button"
+                              aria-label="Close menu"
+                              className="fixed inset-0 z-10 cursor-default"
+                              onClick={() => setLoadMenuOpen(false)}
+                            />
+                            <div role="menu" className="absolute left-0 top-full mt-1 z-20 w-56 rounded-lg border border-gray-200 bg-white py-1 shadow-lg">
+                              {LOAD_RANGE_DAYS.map((days) => {
+                                const done = rangeLoaded(days);
+                                const count = rangeCounts[days];
+                                return (
+                                  <button
+                                    key={days}
+                                    type="button"
+                                    role="menuitem"
+                                    disabled={done}
+                                    onClick={() => loadRange(days)}
+                                    className="flex w-full items-center justify-between px-3 py-2 text-left text-xs text-gray-700 hover:bg-gray-50 disabled:text-gray-400 disabled:hover:bg-white"
+                                  >
+                                    <span>Past {days} days</span>
+                                    <span className="text-gray-400">
+                                      {done ? "loaded" : count === undefined ? "…" : count === null ? "" : count.toLocaleString()}
+                                    </span>
+                                  </button>
+                                );
+                              })}
+                              <button
+                                type="button"
+                                role="menuitem"
+                                onClick={() => loadRange(null)}
+                                className="flex w-full items-center justify-between border-t border-gray-100 px-3 py-2 text-left text-xs font-medium text-gray-900 hover:bg-gray-50"
+                              >
+                                <span>Load all</span>
+                                <span className="text-gray-400">{totalArrivals !== null ? totalArrivals.toLocaleString() : "…"}</span>
+                              </button>
+                            </div>
+                          </>
+                        )}
+                      </div>
                     )}
                   </div>
                 ),
