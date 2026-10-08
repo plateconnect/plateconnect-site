@@ -1211,7 +1211,7 @@ export default function AdminDashboardPage() {
             </div>
 
             {filtersOpen && (
-              <div className="px-4 pb-4 pt-1 border-t border-gray-100">
+              <div className="px-4 pb-4 pt-1 border-t border-gray-100 max-h-[60vh] overflow-y-auto">
                 <div className="grid grid-cols-1 md:grid-cols-3 gap-5 mt-4">
                   <div>
                     <label className="block text-xs font-medium text-gray-500 mb-2">Date Range</label>
