@@ -71,6 +71,17 @@ A claim change only reaches a signed-in client when its ID token refreshes
 in-website admin UI exists — if the site is the only way to grant admin and the
 last admin is lost, the lockout repeats.
 
+## Arrival retention
+
+`arrivals` is pruned nightly (03:30 America/New_York) by the `pruneOldArrivals`
+function (`functions/retention.js`). The policy lives in
+`settings/arrivalRetention` (`enabled`, `days`), edited on the Settings page;
+with no document it defaults to **on, 60 days**. `firestore.rules` bounds `days`
+to 7–3650 and only the function can write `settings/arrivalRetentionLastRun`.
+This is the only thing that deletes arrivals — clients cannot. If you change
+the defaults, change `functions/retention.js` and `src/app/settings/page.tsx`
+together.
+
 ## Gotchas
 
 - **Never create user docs with `addDoc()`.** It mints a random document id,

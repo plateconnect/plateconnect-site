@@ -25,6 +25,8 @@ import {
   zonedDayKey,
   zonedTimeKey,
   currentWeekStartKey,
+  zonedDayStart,
+  shiftDayKey,
   formatDateShort,
   formatTimeShort,
   formatElapsed,
@@ -37,7 +39,6 @@ import {
 // The live listener stays at this size: Firestore rejects a listener whose
 // limit() exceeds 10,000, so anything older is paged in with getDocs instead.
 const ARRIVALS_INITIAL_ROWS = 2000;
-const ARRIVALS_PAGE_ROWS = 4000;
 
 interface Notice {
   id: string;
@@ -661,9 +662,18 @@ export default function AdminDashboardPage() {
 
   // Where the next "Load more" continues from: the oldest document loaded so
   // far, whether by the live listener or by an earlier page-in.
+  // "Load" menu on the Loaded card. Counts are fetched when the menu opens, not
+  // on page load, since each is a handful of billed reads.
+  const LOAD_RANGE_DAYS = [7, 14, 30] as const;
+  const [loadMenuOpen, setLoadMenuOpen] = useState(false);
+  const [rangeCounts, setRangeCounts] = useState<Record<number, number | null>>({});
+  const rangeCountsAt = useRef(0);
   const cursorRef = useRef<QueryDocumentSnapshot | undefined>(undefined);
   const pagedRef = useRef(false);
   const [totalArrivals, setTotalArrivals] = useState<number | null>(null);
+  // Raw document count for the current week, from a server-side count so the
+  // card is right before any of the week is loaded.
+  const [weekCount, setWeekCount] = useState<number | null>(null);
   const [userMap, setUserMap] = useState<Map<string, PersonInfo>>(new Map());
 
   const [startDate, setStartDate] = useState("");
@@ -755,6 +765,33 @@ export default function AdminDashboardPage() {
     };
   }, [user]);
 
+  // Arrivals this week, counted on the server. An aggregation count bills about
+  // one read per 1,000 matching documents (~7 for a week), so it is cheap enough
+  // to refresh every few minutes and the card stays correct without loading rows.
+  useEffect(() => {
+    if (!user || !db) return;
+    const firestore = db;
+    let cancelled = false;
+    const refresh = () => {
+      const start = zonedDayStart(currentWeekStartKey());
+      getCountFromServer(
+        query(collection(firestore, "arrivals"), where("arrival_time", ">=", Timestamp.fromDate(start))),
+      )
+        .then((snap) => {
+          if (!cancelled) setWeekCount(snap.data().count);
+        })
+        .catch(() => {
+          if (!cancelled) setWeekCount(null);
+        });
+    };
+    refresh();
+    const id = setInterval(refresh, 5 * 60_000);
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+    };
+  }, [user]);
+
   const notices = useMemo(() => {
     if (bulkNotices.length === 0) return liveNotices;
     // Live rows win over the bulk copy of the same document.
@@ -794,6 +831,14 @@ export default function AdminDashboardPage() {
       allTime: groupedNotices.length,
     };
   }, [groupedNotices]);
+
+  // The whole week is in memory once everything is loaded or the oldest loaded
+  // row predates the start of the week.
+  const weekLoaded = useMemo(() => {
+    if (totalArrivals !== null && notices.length >= totalArrivals) return true;
+    const oldest = notices[notices.length - 1];
+    return oldest !== undefined && oldest.arrival_time.toDate() <= zonedDayStart(currentWeekStartKey());
+  }, [notices, totalArrivals]);
 
   // Day keys for the clickable stat cards. zonedDayKey returns "YYYY-MM-DD",
   // the same shape the date inputs and the range filter already use, so these
@@ -969,8 +1014,12 @@ export default function AdminDashboardPage() {
     }
   };
 
-  /** Page in older records after what is already loaded. `max` omitted means all. */
-  const loadOlder = async (max?: number) => {
+  /**
+   * Page in older records after what is already loaded. `max` omitted means no
+   * count limit; `since` stops at that time. Continues from the oldest loaded
+   * document, so nothing already in memory is read again.
+   */
+  const loadOlder = async (max?: number, since?: Date) => {
     if (bulkLoading) return;
     setBulkLoading(true);
     setBulkError(null);
@@ -980,6 +1029,7 @@ export default function AdminDashboardPage() {
       const { last } = await fetchArrivals({
         after: cursorRef.current,
         max,
+        since,
         onPage: (page) => setBulkNotices((prev) => [...prev, ...page]),
       });
       if (last) cursorRef.current = last;
@@ -991,18 +1041,54 @@ export default function AdminDashboardPage() {
     }
   };
 
-  const loadAll = () => {
-    if (totalArrivals === null) return;
+  const loadWeek = () => {
+    if (weekLoaded) return;
+    void loadOlder(undefined, zonedDayStart(weekStartKey));
+  };
+
+  /** Start of the day `days` days before today, in school time. */
+  const rangeStart = (days: number) =>
+    zonedDayStart(shiftDayKey(zonedDayKey(new Date()), -days));
+
+  const openLoadMenu = () => {
+    const opening = !loadMenuOpen;
+    setLoadMenuOpen(opening);
+    if (!opening || !db || Date.now() - rangeCountsAt.current < 5 * 60_000) return;
+    rangeCountsAt.current = Date.now();
+    const firestore = db;
+    for (const days of LOAD_RANGE_DAYS) {
+      getCountFromServer(
+        query(
+          collection(firestore, "arrivals"),
+          where("arrival_time", ">=", Timestamp.fromDate(rangeStart(days))),
+        ),
+      )
+        .then((snap) => setRangeCounts((prev) => ({ ...prev, [days]: snap.data().count })))
+        .catch(() => setRangeCounts((prev) => ({ ...prev, [days]: null })));
+    }
+  };
+
+  /** Load the past `days` days, or everything when `days` is null. */
+  const loadRange = (days: number | null) => {
+    const count = days === null ? totalArrivals : rangeCounts[days];
     if (
-      totalArrivals > 20_000 &&
+      count != null &&
+      count > 20_000 &&
       !window.confirm(
-        `Load all ${totalArrivals.toLocaleString()} records? This reads every document (billed Firestore reads) and may take a while.`,
+        `Load ${count.toLocaleString()} records? This reads every one (billed Firestore reads) and may take a while.`,
       )
     ) {
       return;
     }
-    void loadOlder();
+    setLoadMenuOpen(false);
+    void loadOlder(undefined, days === null ? undefined : rangeStart(days));
   };
+
+  const oldestLoadedMs = notices.length
+    ? notices[notices.length - 1].arrival_time.toMillis()
+    : null;
+  const rangeLoaded = (days: number) =>
+    allLoaded || (oldestLoadedMs !== null && oldestLoadedMs <= rangeStart(days).getTime());
 
   const exportOptions = [
     {
@@ -1072,10 +1158,10 @@ export default function AdminDashboardPage() {
                 range: { start: todayKey, end: todayKey },
               },
               {
-                label: "This Week", value: stats.weekTotal, icon: (
+                label: "This Week", value: weekLoaded ? stats.weekTotal : (weekCount ?? stats.weekTotal), icon: (
                   <svg className="w-4 h-4 text-indigo-600" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" /></svg>
                 ), iconBg: "bg-indigo-50",
-                sub: <div className="text-xs text-gray-400 mt-2">arrivals</div>,
+                sub: <div className="text-xs text-gray-400 mt-2">{weekLoaded ? "arrivals" : "detections \u00b7 click to load"}</div>,
                 color: "text-gray-900",
                 range: { start: weekStartKey, end: todayKey },
               },
@@ -1097,30 +1183,65 @@ export default function AdminDashboardPage() {
                     </div>
                     {bulkLoading && (
                       <div className="text-xs text-blue-600">
-                        Loading all records… {notices.length.toLocaleString()} of{" "}
+                        Loading records… {notices.length.toLocaleString()} of{" "}
                         {totalArrivals !== null ? totalArrivals.toLocaleString() : "…"}
                       </div>
                     )}
                     {bulkError && (
-                      <div className="text-xs text-red-600">Load all failed: {bulkError}</div>
+                      <div className="text-xs text-red-600">Load failed: {bulkError}</div>
                     )}
                     {remainingArrivals > 0 && !bulkLoading && (
-                      <button
-                        type="button"
-                        onClick={() => void loadOlder(ARRIVALS_PAGE_ROWS)}
-                        className="px-2.5 py-1 rounded-lg text-xs font-medium text-blue-600 border border-blue-200 hover:bg-blue-50 transition"
-                      >
-                        Load {Math.min(ARRIVALS_PAGE_ROWS, remainingArrivals).toLocaleString()} more
-                      </button>
-                    )}
-                    {remainingArrivals > 0 && !bulkLoading && (
-                      <button
-                        type="button"
-                        onClick={loadAll}
-                        className="ml-2 px-2.5 py-1 rounded-lg text-xs font-medium text-white bg-blue-600 hover:bg-blue-700 transition"
-                      >
-                        Load all ({remainingArrivals.toLocaleString()})
-                      </button>
+                      <div className="relative">
+                        <button
+                          type="button"
+                          onClick={openLoadMenu}
+                          aria-haspopup="menu"
+                          aria-expanded={loadMenuOpen}
+                          className="px-2.5 py-1 rounded-lg text-xs font-medium text-white bg-blue-600 hover:bg-blue-700 transition"
+                        >
+                          Load records &#9662;
+                        </button>
+                        {loadMenuOpen && (
+                          <>
+                            <button
+                              type="button"
+                              aria-label="Close menu"
+                              className="fixed inset-0 z-10 cursor-default"
+                              onClick={() => setLoadMenuOpen(false)}
+                            />
+                            <div role="menu" className="absolute left-0 top-full mt-1 z-20 w-56 rounded-lg border border-gray-200 bg-white py-1 shadow-lg">
+                              {LOAD_RANGE_DAYS.map((days) => {
+                                const done = rangeLoaded(days);
+                                const count = rangeCounts[days];
+                                return (
+                                  <button
+                                    key={days}
+                                    type="button"
+                                    role="menuitem"
+                                    disabled={done}
+                                    onClick={() => loadRange(days)}
+                                    className="flex w-full items-center justify-between px-3 py-2 text-left text-xs text-gray-700 hover:bg-gray-50 disabled:text-gray-400 disabled:hover:bg-white"
+                                  >
+                                    <span>Past {days} days</span>
+                                    <span className="text-gray-400">
+                                      {done ? "loaded" : count === undefined ? "…" : count === null ? "" : count.toLocaleString()}
+                                    </span>
+                                  </button>
+                                );
+                              })}
+                              <button
+                                type="button"
+                                role="menuitem"
+                                onClick={() => loadRange(null)}
+                                className="flex w-full items-center justify-between border-t border-gray-100 px-3 py-2 text-left text-xs font-medium text-gray-900 hover:bg-gray-50"
+                              >
+                                <span>Load all</span>
+                                <span className="text-gray-400">{totalArrivals !== null ? totalArrivals.toLocaleString() : "…"}</span>
+                              </button>
+                            </div>
+                          </>
+                        )}
+                      </div>
                     )}
                   </div>
                 ),
@@ -1169,7 +1290,11 @@ export default function AdminDashboardPage() {
                   title={active
                     ? `Showing ${s.label.toLowerCase()} only — click to clear`
                     : `Filter the table to ${s.label.toLowerCase()}`}
-                  onClick={() => applyRange(range.start, range.end)}
+                  onClick={() => {
+                    applyRange(range.start, range.end);
+                    // Applying (not clearing) the week filter also pulls in the week.
+                    if (s.label === "This Week" && !active) loadWeek();
+                  }}
                   className={`bg-white rounded-xl border p-5 text-left w-full transition cursor-pointer ${
                     active
                       ? "border-blue-500 ring-2 ring-blue-100"
@@ -1211,7 +1336,7 @@ export default function AdminDashboardPage() {
             </div>
 
             {filtersOpen && (
-              <div className="px-4 pb-4 pt-1 border-t border-gray-100">
+              <div className="px-4 pb-4 pt-1 border-t border-gray-100 max-h-[60vh] overflow-y-auto">
                 <div className="grid grid-cols-1 md:grid-cols-3 gap-5 mt-4">
                   <div>
                     <label className="block text-xs font-medium text-gray-500 mb-2">Date Range</label>

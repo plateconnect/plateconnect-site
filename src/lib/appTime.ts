@@ -48,6 +48,31 @@ export function shiftDayKey(key: string, days: number) {
   return noon.toISOString().split("T")[0];
 }
 
+const WALL_FMT = new Intl.DateTimeFormat("en-CA", {
+  timeZone: APP_TIME_ZONE,
+  year: "numeric",
+  month: "2-digit",
+  day: "2-digit",
+  hour: "2-digit",
+  minute: "2-digit",
+  second: "2-digit",
+  hourCycle: "h23",
+});
+
+/** The instant a school-time day begins (00:00 in APP_TIME_ZONE) for a "YYYY-MM-DD" key. */
+export function zonedDayStart(key: string) {
+  const [y, m, d] = key.split("-").map(Number);
+  const target = Date.UTC(y, m - 1, d);
+  let t = target;
+  // Nudge by the zone's offset at t; a second pass settles it across a DST change.
+  for (let i = 0; i < 2; i++) {
+    const p = partsOf(WALL_FMT, new Date(t));
+    const wall = Date.UTC(+p.year, +p.month - 1, +p.day, +p.hour, +p.minute, +p.second);
+    t += target - wall;
+  }
+  return new Date(t);
+}
+
 /** Day of week (0 = Sunday) for a day key. */
 export function dayKeyWeekday(key: string) {
   const [y, m, d] = key.split("-").map(Number);
