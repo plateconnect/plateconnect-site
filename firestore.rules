@@ -149,7 +149,36 @@ service cloud.firestore {
     // Readable by staff (the console renders with it), writable by admins only.
     match /settings/{settingId} {
       allow get, list: if isStaff();
-      allow write: if isAdmin();
+      // The retention documents have their own, stricter rules below.
+      allow write: if isAdmin()
+                   && settingId != 'arrivalRetention'
+                   && settingId != 'arrivalRetentionLastRun';
+    }
+
+    // How long arrival logs are kept before the pruneOldArrivals function
+    // deletes them. Admins may only set `enabled` and `days` (7..3650 days) —
+    // a floor stops a typo from wiping recent history.
+    function validRetention(d) {
+      return d.enabled is bool
+          && d.days is int
+          && d.days >= 7
+          && d.days <= 3650;
+    }
+
+    match /settings/arrivalRetention {
+      allow create: if isAdmin()
+                    && validRetention(request.resource.data)
+                    && request.resource.data.keys()
+                       .hasOnly(['enabled', 'days', 'updatedAt', 'updatedBy']);
+      allow update: if isAdmin()
+                    && validRetention(request.resource.data)
+                    && request.resource.data.diff(resource.data).affectedKeys()
+                       .hasOnly(['enabled', 'days', 'updatedAt', 'updatedBy']);
+    }
+
+    // Result of the last prune run. Written only by the function (Admin SDK).
+    match /settings/arrivalRetentionLastRun {
+      allow write: if false;
     }
 
     // ─── adminAuditLog ──────────────────────────────────────────────────────

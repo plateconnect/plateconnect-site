@@ -269,6 +269,7 @@ exports.sendPickupNotificationHttp = onRequest(
 const plates = require("./plates");
 const userAdmin = require("./user_admin");
 const links = require("./links");
+const retention = require("./retention");
 
 // plate -> guardian index, so the detection pipeline does one read per
 // detection instead of streaming the whole users collection.
@@ -287,4 +288,5 @@ exports.setUserPrivilege = userAdmin.setUserPrivilege;
 // mirrored so rules can authorise ward reads without an extra lookup.
 exports.syncGuardianLinks = links.syncGuardianLinks;
 exports.linkWardByEmail = links.linkWardByEmail;
+exports.pruneOldArrivals = retention.pruneOldArrivals;
 exports.unlinkWard = links.unlinkWard;
