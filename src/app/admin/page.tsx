@@ -33,12 +33,13 @@ import {
 } from "@/lib/appTime";
 
 // `arrivals` is append-only and grows ~990 documents a day, so reading all of
-// it on every page view gets steadily more expensive forever. Load a couple of
-// days by default and let the user pull more on demand.
+// it on every page view gets steadily more expensive forever. Load today's
+// arrivals by default and let the user pull more on demand.
 //
-// The live listener stays at this size: Firestore rejects a listener whose
-// limit() exceeds 10,000, so anything older is paged in with getDocs instead.
-const ARRIVALS_INITIAL_ROWS = 2000;
+// The live listener is bounded by DATE, not by a row count: a fixed limit cut
+// off part of today whenever a day had more arrivals than the limit. Older
+// records are paged in with getDocs (Firestore also rejects a listener whose
+// limit() exceeds 10,000).
 
 interface Notice {
   id: string;
@@ -647,12 +648,14 @@ function MultiSelectPills({
 export default function AdminDashboardPage() {
   const { user, isAdmin, loading } = useAuth();
   const router = useRouter();
-  // `liveNotices` is the real-time window (newest ARRIVALS_INITIAL_ROWS rows). "Load all"
+  // `liveNotices` is the real-time window (every arrival from the start of today, school time). "Load all"
   // pages the rest in separately as `bulkNotices`; `notices` is the merge.
   const [liveNotices, setLiveNotices] = useState<Notice[]>([]);
   const [bulkNotices, setBulkNotices] = useState<Notice[]>([]);
   const [bulkLoading, setBulkLoading] = useState(false);
   const [bulkError, setBulkError] = useState<string | null>(null);
+  // How many records the running load expects to bring in, for the progress line.
+  const [loadTarget, setLoadTarget] = useState<number | null>(null);
   const [lastSyncTime, setLastSyncTime] = useState<Date | null>(null);
   const [now, setNow] = useState(() => new Date());
   const [filtersOpen, setFiltersOpen] = useState(false);
@@ -700,19 +703,23 @@ export default function AdminDashboardPage() {
     return () => clearInterval(id);
   }, []);
 
+  // Re-subscribes when the school day rolls over, so a tab left open past
+  // midnight moves on to the new day instead of showing yesterday as "today".
+  const liveDayKey = zonedDayKey(now);
   useEffect(() => {
     if (!user || !db) return;
     // Bounded on purpose. This used to be an unbounded onSnapshot over the
-    // whole `arrivals` collection, so every visit read all 12,700+ documents,
-    // and the cost grew with the log forever (~990 new arrivals a day).
+    // whole `arrivals` collection, so every visit read the entire log, and the
+    // cost grew with it forever.
     //
-    // Paginated rather than fixed: a hard cap silently hid older rows, which
-    // looked like data loss. The user now controls how far back to load, so
-    // history is always reachable and the reads are only spent when asked for.
+    // It is bounded by date rather than by a row count so that today is always
+    // complete: a fixed `limit()` silently dropped today's oldest arrivals on
+    // busy days. History is reachable via the Load menu, and its reads are only
+    // spent when asked for.
     const q = query(
       collection(db, "arrivals"),
+      where("arrival_time", ">=", Timestamp.fromDate(zonedDayStart(liveDayKey))),
       orderBy("arrival_time", "desc"),
-      limit(ARRIVALS_INITIAL_ROWS),
     );
     const unsubscribe = onSnapshot(
       q,
@@ -726,11 +733,11 @@ export default function AdminDashboardPage() {
       (err) => console.error("arrivals listener failed", err),
     );
     return () => unsubscribe();
-  }, [user]);
+  }, [user, liveDayKey]);
 
   // Live user directory for resolving names and roles on arrivals. ~105
-  // documents against 2000 arrivals, so a ~5% read increase, and it keeps the
-  // Type and Name columns in step with user management.
+  // documents, a small fraction of the arrivals read, and it keeps the Type and
+  // Name columns in step with user management.
   useEffect(() => {
     if (!user || !db) return;
     const unsubscribe = onSnapshot(collection(db, "users"), (snapshot) => {
@@ -836,9 +843,11 @@ export default function AdminDashboardPage() {
   // row predates the start of the week.
   const weekLoaded = useMemo(() => {
     if (totalArrivals !== null && notices.length >= totalArrivals) return true;
+    // On the week's first day, today's live window already is the whole week.
+    if (currentWeekStartKey() === liveDayKey) return true;
     const oldest = notices[notices.length - 1];
     return oldest !== undefined && oldest.arrival_time.toDate() <= zonedDayStart(currentWeekStartKey());
-  }, [notices, totalArrivals]);
+  }, [notices, totalArrivals, liveDayKey]);
 
   // Day keys for the clickable stat cards. zonedDayKey returns "YYYY-MM-DD",
   // the same shape the date inputs and the range filter already use, so these
@@ -989,15 +998,17 @@ export default function AdminDashboardPage() {
       return allLoaded ? groupedNotices : group((await fetchArrivals()).rows);
     }
 
-    // today / this-week: reuse the loaded rows if they reach back far enough.
-    // The lookback is generous so the zone offset and an arrival/departure pair
-    // straddling the boundary are still included.
-    const days = scope === "today" ? 2 : 8;
-    const since = new Date(Date.now() - days * 86_400_000);
-    const oldest = notices.length ? notices[notices.length - 1].arrival_time.toDate() : null;
-    const covered = allLoaded || (oldest !== null && oldest <= since);
-    const grouped = covered ? groupedNotices : group((await fetchArrivals({ since })).rows);
-    const startKey = scope === "today" ? zonedDayKey(new Date()) : currentWeekStartKey();
+    // Today is always fully loaded: the live window starts at today's midnight.
+    if (scope === "today") {
+      const todayKey = zonedDayKey(new Date());
+      return groupedNotices.filter((n) => dayKeyOf(n) >= todayKey);
+    }
+
+    // This week: reuse the loaded rows if they already reach the week's start.
+    const startKey = currentWeekStartKey();
+    const grouped = weekLoaded
+      ? groupedNotices
+      : group((await fetchArrivals({ since: zonedDayStart(startKey) })).rows);
     return grouped.filter((n) => dayKeyOf(n) >= startKey);
   };
 
@@ -1019,8 +1030,9 @@ export default function AdminDashboardPage() {
    * count limit; `since` stops at that time. Continues from the oldest loaded
    * document, so nothing already in memory is read again.
    */
-  const loadOlder = async (max?: number, since?: Date) => {
+  const loadOlder = async (max?: number, since?: Date, target?: number | null) => {
     if (bulkLoading) return;
+    setLoadTarget(target ?? null);
     setBulkLoading(true);
     setBulkError(null);
     pagedRef.current = true;
@@ -1043,12 +1055,16 @@ export default function AdminDashboardPage() {
 
   const loadWeek = () => {
     if (weekLoaded) return;
-    void loadOlder(undefined, zonedDayStart(weekStartKey));
+    void loadOlder(undefined, zonedDayStart(weekStartKey), weekCount);
   };
 
-  /** Start of the day `days` days before today, in school time. */
+  /**
+   * Start of the range "past N days": today plus the N-1 days before it, in
+   * school time, so "past 7 days" is seven calendar days and lines up with the
+   * Today and This Week cards.
+   */
   const rangeStart = (days: number) =>
-    zonedDayStart(shiftDayKey(zonedDayKey(new Date()), -days));
+    zonedDayStart(shiftDayKey(zonedDayKey(new Date()), -(days - 1)));
 
   const openLoadMenu = () => {
     const opening = !loadMenuOpen;
@@ -1081,7 +1097,7 @@ export default function AdminDashboardPage() {
       return;
     }
     setLoadMenuOpen(false);
-    void loadOlder(undefined, days === null ? undefined : rangeStart(days));
+    void loadOlder(undefined, days === null ? undefined : rangeStart(days), count);
   };
 
   const oldestLoadedMs = notices.length
@@ -1183,8 +1199,8 @@ export default function AdminDashboardPage() {
                     </div>
                     {bulkLoading && (
                       <div className="text-xs text-blue-600">
-                        Loading records… {notices.length.toLocaleString()} of{" "}
-                        {totalArrivals !== null ? totalArrivals.toLocaleString() : "…"}
+                        Loading records… {notices.length.toLocaleString()}
+                        {loadTarget != null && <> of {loadTarget.toLocaleString()}</>}
                       </div>
                     )}
                     {bulkError && (
