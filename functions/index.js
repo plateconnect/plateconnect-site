@@ -289,4 +289,7 @@ exports.setUserPrivilege = userAdmin.setUserPrivilege;
 exports.syncGuardianLinks = links.syncGuardianLinks;
 exports.linkWardByEmail = links.linkWardByEmail;
 exports.pruneOldArrivals = retention.pruneOldArrivals;
+
+// Fresh signed links for detection images; stored ones expire after 7 days.
+exports.getImageUrl = require("./images").getImageUrl;
 exports.unlinkWard = links.unlinkWard;

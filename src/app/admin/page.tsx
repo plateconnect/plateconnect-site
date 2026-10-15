@@ -3,7 +3,8 @@
 import { useState, useEffect, useMemo, useRef } from "react";
 import { useRouter } from "next/navigation";
 import { useAuth } from "@/context/AuthContext";
-import { db } from "@/lib/firebase";
+import { db, functions } from "@/lib/firebase";
+import { httpsCallable } from "firebase/functions";
 import {
   collection,
   query,
@@ -537,11 +538,51 @@ function LocationCell({ location }: { location?: string }) {
 }
 
 function ImageCell({ url }: { url?: string }) {
+  const [busy, setBusy] = useState(false);
   if (!url) return <span className="text-xs text-gray-300">—</span>;
+
+  // Stored links are signed URLs that Google expires after 7 days, so ask the
+  // getImageUrl function for a fresh one on every click. The tab is opened
+  // synchronously first, otherwise the popup blocker eats the async open.
+  const open = async () => {
+    if (busy) return;
+    if (!functions) {
+      window.open(url, "_blank", "noopener,noreferrer");
+      return;
+    }
+    const tab = window.open("", "_blank");
+    setBusy(true);
+    try {
+      const res = await httpsCallable<{ url: string }, { url: string }>(
+        functions,
+        "getImageUrl",
+      )({ url });
+      if (tab) {
+        tab.opener = null;
+        tab.location.href = res.data.url;
+      }
+    } catch (err) {
+      tab?.close();
+      const code = (err as { code?: string }).code ?? "";
+      alert(
+        code.endsWith("not-found")
+          ? "This image no longer exists in storage."
+          : "Couldn't load the image. Please try again.",
+      );
+    } finally {
+      setBusy(false);
+    }
+  };
+
   return (
-    <a href={url} target="_blank" rel="noopener noreferrer" className="text-sm text-blue-600 hover:text-blue-700 hover:underline">
-      View image
-    </a>
+    <button
+      type="button"
+      onClick={open}
+      disabled={busy}
+      className="text-sm text-blue-600 hover:text-blue-700 hover:underline disabled:opacity-50"
+    >
+      {busy ? "Loading…" : "View image"}
+    </button>
   );
 }
 
