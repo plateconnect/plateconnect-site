@@ -82,6 +82,14 @@ This is the only thing that deletes arrivals — clients cannot. If you change
 the defaults, change `functions/retention.js` and `src/app/settings/page.tsx`
 together.
 
+## Detection images
+
+`image_url` / `departure_image_url` on arrivals are V4 signed Storage URLs,
+which Google caps at 7 days. Never open them directly: `ImageCell` calls the
+admin-only `getImageUrl` callable (`functions/images.js`), which parses the
+object path out of the stored URL and returns a fresh 15-minute link. The
+service account needs `roles/iam.serviceAccountTokenCreator` on itself to sign.
+
 ## Gotchas
 
 - **Never create user docs with `addDoc()`.** It mints a random document id,
