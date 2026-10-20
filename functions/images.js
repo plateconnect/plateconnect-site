@@ -11,6 +11,7 @@
  * going forward) or the old `url`, from which the object path is parsed.
  */
 const {onCall, HttpsError} = require("firebase-functions/v2/https");
+const logger = require("firebase-functions/logger");
 const admin = require("firebase-admin");
 
 const LINK_MINUTES = 15;
@@ -83,6 +84,15 @@ exports.getImageUrl = onCall(async (request) => {
   } else if (url) {
     const parsed = parseStorageUrl(String(url));
     if (!parsed) {
+      logger.warn("getImageUrl: unparseable url", {
+        host: (() => {
+          try {
+            return new URL(String(url)).hostname;
+          } catch (e) {
+            return "invalid";
+          }
+        })(),
+      });
       throw new HttpsError("invalid-argument", "Not a Cloud Storage URL");
     }
     bucketName = parsed.bucket;
@@ -92,12 +102,14 @@ exports.getImageUrl = onCall(async (request) => {
   }
 
   if (!isProjectBucket(bucketName)) {
+    logger.warn("getImageUrl: rejected bucket", {bucketName});
     throw new HttpsError("permission-denied", "Unknown storage bucket");
   }
 
   const file = admin.storage().bucket(bucketName).file(objectPath);
   const [exists] = await file.exists();
   if (!exists) {
+    logger.warn("getImageUrl: object missing", {bucketName, objectPath});
     throw new HttpsError("not-found", "Image no longer exists in storage");
   }
 

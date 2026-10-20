@@ -563,11 +563,12 @@ function ImageCell({ url }: { url?: string }) {
       }
     } catch (err) {
       tab?.close();
-      const code = (err as { code?: string }).code ?? "";
+      const e = err as { code?: string; message?: string };
+      console.error("getImageUrl failed", err);
       alert(
-        code.endsWith("not-found")
+        (e.code ?? "").endsWith("not-found")
           ? "This image no longer exists in storage."
-          : "Couldn't load the image. Please try again.",
+          : `Couldn't load the image: ${e.message ?? "unknown error"}`,
       );
     } finally {
       setBusy(false);
