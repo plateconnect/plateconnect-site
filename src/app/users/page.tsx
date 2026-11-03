@@ -26,7 +26,12 @@ interface AppUser {
   account_type: "guardian" | "student" | string;
   grade?: number;
   wardIds?: string[];
+  // The plates this person owns, read from whichever field actually holds
+  // them (see vehiclesOf). Kept as plain strings for the form and the list.
   licensePlateNumbers?: string[];
+  // Same plates with their descriptions — what syncPlateIndex reads. Kept so
+  // a save can write them back without dropping descriptions set elsewhere.
+  vehicles?: Vehicle[];
   fcmToken?: string;
   fcmTokenUpdatedAt?: Timestamp;
   onboardingComplete?: boolean;
@@ -37,6 +42,70 @@ interface AppUser {
   // switch, which lives on their login (see setUserPrivilege in
   // functions/user_admin.js) — kept here only so this page can show it.
   admin?: boolean;
+}
+
+interface Vehicle {
+  plate: string;
+  plateNormalized: string;
+  description: string | null;
+}
+
+/** Must match normalizePlate() in functions/plates.js. */
+function normalizePlate(plate: string): string {
+  return plate.toUpperCase().replace(/[^A-Z0-9]/g, "");
+}
+
+/**
+ * A user document's plates, read the same way syncPlateIndex
+ * (functions/plates.js userPlateEntries) reads them: the `vehicles` array
+ * when it has entries, else the legacy licensePlateNumbers/carDescriptions
+ * parallel arrays.
+ *
+ * This page used to read and write only licensePlateNumbers. Accounts made by
+ * createUserAccount or the mobile app carry `vehicles`, which the trigger
+ * prefers — so an edit here changed what this page showed but never reached
+ * the plate index, and the gate kept reporting the new plate as unknown.
+ */
+function vehiclesOf(data: Record<string, unknown>): Vehicle[] {
+  const vehicles = Array.isArray(data.vehicles) ? data.vehicles : [];
+  if (vehicles.length > 0) {
+    return vehicles
+      .filter((v): v is { plate: string; plateNormalized?: string; description?: string | null } =>
+        Boolean(v && typeof v === "object" && (v as { plate?: unknown }).plate))
+      .map((v) => ({
+        plate: String(v.plate),
+        plateNormalized: v.plateNormalized || normalizePlate(String(v.plate)),
+        description: v.description ?? null,
+      }));
+  }
+  const plates = Array.isArray(data.licensePlateNumbers) ? data.licensePlateNumbers : [];
+  const descriptions = Array.isArray(data.carDescriptions) ? data.carDescriptions : [];
+  return plates
+    .map((plate, i) => ({ plate, description: descriptions[i] }))
+    .filter(({ plate }) => Boolean(plate))
+    .map(({ plate, description }) => ({
+      plate: String(plate),
+      plateNormalized: normalizePlate(String(plate)),
+      description: description ? String(description) : null,
+    }));
+}
+
+/**
+ * Every plate field for a save, kept in step: `vehicles` (what the plate index
+ * reads) plus the legacy parallel arrays (what older app builds read).
+ * Descriptions already on file are carried over for plates that are kept.
+ */
+function plateFields(plates: string[], existing: Vehicle[] = []): Record<string, unknown> {
+  const byNorm = new Map(existing.map((v) => [v.plateNormalized, v]));
+  const vehicles: Vehicle[] = plates.map((plate) => {
+    const norm = normalizePlate(plate);
+    return { plate, plateNormalized: norm, description: byNorm.get(norm)?.description ?? null };
+  });
+  return {
+    vehicles,
+    licensePlateNumbers: vehicles.map((v) => v.plate),
+    carDescriptions: vehicles.map((v) => v.description ?? ""),
+  };
 }
 
 // ─── Account types ──────────────────────────────────────────────────────────
@@ -308,7 +377,7 @@ function partitionRows(
 // only when non-blank; never touch wardIds/onboardingComplete/fcmToken.
 function updateUserPayload(data: ImportRow, existing: AppUser): Record<string, unknown> {
   const payload: Record<string, unknown> = {
-    licensePlateNumbers: data.plates, // replace
+    ...plateFields(data.plates, existing.vehicles), // replace
   };
   if (data.name) payload.name = data.name;
   if (data.account_type) payload.account_type = data.account_type;
@@ -774,7 +843,17 @@ function UserModal({
                   {emailState === "not-needed" && (
                     <p className="mt-2 text-xs text-gray-500 bg-gray-50 px-2.5 py-1.5 rounded">
                       Access granted. They already had a login for this site,
-                      so no new email was needed.
+                      so no email was sent. If they never set a password
+                      (accounts added here or by CSV import start without
+                      one),{" "}
+                      <button
+                        type="button"
+                        onClick={sendSetupEmail}
+                        className="font-medium text-blue-700 hover:text-blue-800 underline"
+                      >
+                        send them a password setup email
+                      </button>
+                      .
                     </p>
                   )}
                   {emailState === "error" && (
@@ -1375,6 +1454,7 @@ function UserManagementContent() {
       const usersData: AppUser[] = [];
       snapshot.forEach((docSnap) => {
         const data = docSnap.data();
+        const vehicles = vehiclesOf(data);
         usersData.push({
           id: docSnap.id,
           name: data.name || "Unknown",
@@ -1382,7 +1462,8 @@ function UserManagementContent() {
           account_type: data.account_type || "unknown",
           grade: data.grade,
           wardIds: data.wardIds || [],
-          licensePlateNumbers: data.licensePlateNumbers || [],
+          licensePlateNumbers: vehicles.map((v) => v.plate),
+          vehicles,
           fcmToken: data.fcmToken,
           fcmTokenUpdatedAt: data.fcmTokenUpdatedAt,
           onboardingComplete: data.onboardingComplete,
@@ -1522,7 +1603,7 @@ function UserManagementContent() {
 
   // ── Firebase write helpers ────────────────────────────────────────────────
 
-  const buildPayload = (form: UserFormData) => {
+  const buildPayload = (form: UserFormData, existing?: AppUser) => {
     const base: Record<string, unknown> = {
       name: form.name.trim(),
       email: form.email.trim() || null,
@@ -1533,7 +1614,10 @@ function UserManagementContent() {
       base.grade = form.grade ? parseInt(form.grade, 10) : null;
     } else {
       // Any non-student role can own vehicles.
-      base.licensePlateNumbers = splitCsv(form.licensePlateNumbers);
+      Object.assign(
+        base,
+        plateFields(splitCsv(form.licensePlateNumbers), existing?.vehicles),
+      );
       // Only guardians pick students up, so only they carry wardIds. Writing
       // an empty array onto faculty rows would make the plate-index trigger
       // and the security rules reason about links that do not exist.
@@ -1546,7 +1630,7 @@ function UserManagementContent() {
 
   const handleSaveEdit = async (form: UserFormData) => {
     if (!editTarget || !db) throw new Error("No target user");
-    await updateDoc(doc(db, "users", editTarget.id), buildPayload(form));
+    await updateDoc(doc(db, "users", editTarget.id), buildPayload(form, editTarget));
   };
 
   // Creating a user goes through a callable, never addDoc().
@@ -1574,12 +1658,10 @@ function UserManagementContent() {
       wardIds: form.account_type === "guardian"
         ? splitCsv(form.wardIds)
         : undefined,
-      vehicles: form.account_type === "guardian"
-        ? splitCsv(form.licensePlateNumbers).map((plate) => ({
-            plate,
-            plateNormalized: plate.toUpperCase().replace(/[^A-Z0-9]/g, ""),
-            description: null,
-          }))
+      // Any non-student role can own vehicles — this used to send them for
+      // guardians only, so faculty/staff added here lost their plates.
+      vehicles: form.account_type !== "student"
+        ? plateFields(splitCsv(form.licensePlateNumbers)).vehicles
         : undefined,
     });
 
@@ -1642,11 +1724,7 @@ function UserManagementContent() {
           grade: row.data.account_type === "student" && row.data.grade
             ? parseInt(row.data.grade, 10)
             : undefined,
-          vehicles: row.data.plates.map((plate) => ({
-            plate,
-            plateNormalized: plate.toUpperCase().replace(/[^A-Z0-9]/g, ""),
-            description: null,
-          })),
+          vehicles: plateFields(row.data.plates).vehicles,
         });
         created++;
       } catch (err) {

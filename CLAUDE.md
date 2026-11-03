@@ -96,6 +96,12 @@ service account needs `roles/iam.serviceAccountTokenCreator` on itself to sign.
   but every read is `doc(db, 'users', <auth uid>)`. Such users appear in the
   admin list yet can never load their own profile. Use the `createUserAccount`
   callable, which creates the Auth account first and keys the doc by its UID.
+- **Plates live in `vehicles`.** `syncPlateIndex` reads the `vehicles` array
+  and only falls back to `licensePlateNumbers` when `vehicles` is empty. Any
+  write that changes plates must update both (the Users page's `plateFields()`
+  and `createUserAccount` do). Writing only `licensePlateNumbers` looks saved
+  in the UI but never reaches the `plates` index, so the gate keeps reporting
+  the new plate as unknown.
 - **Archive, never delete.** `archiveUser` / `restoreUser` callables. A hard
   delete is what caused the Aug 2026 data loss.
 - **`account_type` is not a permission.** `admin`, `staff`, `faculty` and

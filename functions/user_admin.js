@@ -44,6 +44,22 @@ function requireAdmin(request) {
 }
 
 /**
+ * Plate fields for a new profile: `vehicles` (what syncPlateIndex reads) plus
+ * the legacy parallel arrays, so the website and older app builds that read
+ * licensePlateNumbers see the same plates as the gate does.
+ * @param {!Array<{plate: string, description: ?string}>} vehicles Vehicles.
+ * @return {object} Fields to merge into the user document.
+ */
+function plateFields(vehicles) {
+  const kept = vehicles.filter((v) => v && v.plate);
+  return {
+    vehicles: kept,
+    licensePlateNumbers: kept.map((v) => v.plate),
+    carDescriptions: kept.map((v) => v.description || ""),
+  };
+}
+
+/**
  * Create a user, keyed by Auth UID.
  *
  * The admin website previously used addDoc(), which mints a RANDOM document
@@ -100,7 +116,7 @@ const createUserAccount = onCall(async (request) => {
       onboardingComplete: false,
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     };
-    if (Array.isArray(vehicles)) body.vehicles = vehicles;
+    if (Array.isArray(vehicles)) Object.assign(body, plateFields(vehicles));
     if (dup.empty) {
       body.createdAt = admin.firestore.FieldValue.serverTimestamp();
     }
@@ -136,7 +152,7 @@ const createUserAccount = onCall(async (request) => {
   if (role === "student" && Number.isInteger(grade)) {
     profile.grade = grade;
   }
-  if (Array.isArray(vehicles)) profile.vehicles = vehicles;
+  if (Array.isArray(vehicles)) Object.assign(profile, plateFields(vehicles));
   if (Array.isArray(wardIds)) profile.wardIds = wardIds;
 
   const ref = admin.firestore().collection("users").doc(user.uid);
