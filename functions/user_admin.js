@@ -10,6 +10,7 @@
  *   exports.purgeArchivedUsers = userAdmin.purgeArchivedUsers;
  *   exports.verifyStaffPin = userAdmin.verifyStaffPin;
  *   exports.setUserPrivilege = userAdmin.setUserPrivilege;
+ *   exports.setTemporaryPassword = userAdmin.setTemporaryPassword;
  */
 const {onCall, HttpsError} = require("firebase-functions/v2/https");
 const {onSchedule} = require("firebase-functions/v2/scheduler");
@@ -241,6 +242,69 @@ async function countAdmins({excludeUid} = {}) {
 }
 
 /**
+ * The Auth account for a uid, or null if there is none.
+ * @param {string} uid User id.
+ * @return {Promise<?object>} The Auth user record.
+ */
+async function getAuthUser(uid) {
+  try {
+    return await admin.auth().getUser(uid);
+  } catch (e) {
+    if (e.code !== "auth/user-not-found") throw e;
+    return null;
+  }
+}
+
+/**
+ * Create a login for a users/{uid} record that has none, keyed by that SAME
+ * id so nothing that reads doc(db,'users',uid) has to change. Refuses when
+ * the record has no email, or the email already belongs to another login.
+ * @param {string} uid The users/{uid} document id.
+ * @param {object} userData That document's data.
+ * @return {Promise<object>} The new Auth user record.
+ */
+async function createLoginForRecord(uid, userData) {
+  if (!userData.email) {
+    throw new HttpsError(
+        "failed-precondition",
+        "This person has no email on file, so a login can't be created " +
+        "for them. Add an email first.",
+    );
+  }
+
+  // A login for this email might already exist under a DIFFERENT uid —
+  // most likely this person has a second, duplicate record. Creating a
+  // second Auth account for the same email would silently split them
+  // into two separate logins, so refuse rather than guess which one to
+  // use.
+  let emailInUseByUid = null;
+  try {
+    const byEmail = await admin.auth().getUserByEmail(userData.email);
+    emailInUseByUid = byEmail.uid;
+  } catch (e) {
+    if (e.code !== "auth/user-not-found") throw e;
+  }
+  if (emailInUseByUid) {
+    throw new HttpsError(
+        "failed-precondition",
+        `${userData.email} already has a login, on a different record ` +
+        `(uid ${emailInUseByUid}). Grant access on that record instead, ` +
+        "or fix the duplicate first.",
+    );
+  }
+
+  return admin.auth().createUser({
+    uid,
+    email: userData.email,
+    displayName: userData.name || undefined,
+    // Random and never shown to anyone: the person claims the account via
+    // the setup email or a temporary password an admin sets afterwards.
+    password: require("crypto").randomBytes(32).toString("hex"),
+    emailVerified: false,
+  });
+}
+
+/**
  * Grant or revoke the admin claim for a user. The in-website equivalent of
  * `set_claims.py --grant admin` / `--revoke admin`, extended so it never
  * depends on the person already having a login for the mobile app.
@@ -301,14 +365,7 @@ const setUserPrivilege = onCall(async (request) => {
   }
   const userData = userDoc.data() || {};
 
-  let targetUser;
-  try {
-    targetUser = await admin.auth().getUser(uid);
-  } catch (e) {
-    if (e.code !== "auth/user-not-found") throw e;
-    targetUser = null;
-  }
-
+  let targetUser = await getAuthUser(uid);
   let accountCreated = false;
 
   if (!targetUser) {
@@ -317,45 +374,7 @@ const setUserPrivilege = onCall(async (request) => {
       // held the claim either.
       return {uid, admin: false, changed: false, accountCreated: false};
     }
-
-    if (!userData.email) {
-      throw new HttpsError(
-          "failed-precondition",
-          "This person has no email on file, so a login can't be created " +
-          "for them. Add an email first.",
-      );
-    }
-
-    // A login for this email might already exist under a DIFFERENT uid —
-    // most likely this person has a second, duplicate record. Creating a
-    // second Auth account for the same email would silently split them
-    // into two separate logins, so refuse rather than guess which one to
-    // use.
-    let emailInUseByUid = null;
-    try {
-      const byEmail = await admin.auth().getUserByEmail(userData.email);
-      emailInUseByUid = byEmail.uid;
-    } catch (e) {
-      if (e.code !== "auth/user-not-found") throw e;
-    }
-    if (emailInUseByUid) {
-      throw new HttpsError(
-          "failed-precondition",
-          `${userData.email} already has a login, on a different record ` +
-          `(uid ${emailInUseByUid}). Grant access on that record instead, ` +
-          "or fix the duplicate first.",
-      );
-    }
-
-    targetUser = await admin.auth().createUser({
-      uid,
-      email: userData.email,
-      displayName: userData.name || undefined,
-      // No password: the account is claimed through the email sent after
-      // this returns, so no shared secret is ever transmitted or stored.
-      password: require("crypto").randomBytes(32).toString("hex"),
-      emailVerified: false,
-    });
+    targetUser = await createLoginForRecord(uid, userData);
     accountCreated = true;
   }
 
@@ -406,12 +425,84 @@ const setUserPrivilege = onCall(async (request) => {
     at: admin.firestore.FieldValue.serverTimestamp(),
   });
 
-  // The setup email itself is sent by the website right after this
-  // resolves, using Firebase Auth's own built-in "reset password" email —
+  // The setup email (when the admin chose it over a temporary password) is
+  // sent by the website right after this resolves, using Firebase Auth's own
+  // built-in "reset password" email —
   // there's no email-sending service in this project to send a custom one
   // from here, and that built-in flow is exactly "click this link to set a
   // password" regardless of whether one existed before.
   return {uid, admin: grantAdmin, changed: true, accountCreated};
+});
+
+/**
+ * Set a temporary password for someone, creating their login first if they
+ * have none. The stop-gap for when the emailed setup link isn't reaching
+ * people or isn't working: an admin sets a password and passes it on in
+ * person or by phone.
+ *
+ * The password is never stored or logged here — only the fact that one was
+ * set, and by whom, goes to adminAuditLog. users/{uid}.mustChangePassword is
+ * set so the website makes the person choose their own password the first
+ * time they sign in with it.
+ *
+ * Does not grant admin by itself; setUserPrivilege does that.
+ */
+const setTemporaryPassword = onCall(async (request) => {
+  const callerUid = requireAdmin(request);
+  const {uid, password} = request.data || {};
+
+  if (!uid) throw new HttpsError("invalid-argument", "uid is required");
+  if (typeof password !== "string" ||
+      password.length < 8 || password.length > 128) {
+    throw new HttpsError(
+        "invalid-argument",
+        "The temporary password must be 8 to 128 characters",
+    );
+  }
+  if (uid === callerUid) {
+    throw new HttpsError(
+        "failed-precondition",
+        "Change your own password from the sign-in page instead",
+    );
+  }
+
+  const userDocRef = admin.firestore().collection("users").doc(uid);
+  const userDoc = await userDocRef.get();
+  if (!userDoc.exists) {
+    throw new HttpsError("not-found", `No user record for ${uid}`);
+  }
+  const userData = userDoc.data() || {};
+  if (userData.status === "archived") {
+    throw new HttpsError(
+        "failed-precondition",
+        "This person is archived. Restore them first.",
+    );
+  }
+
+  let accountCreated = false;
+  if (!(await getAuthUser(uid))) {
+    await createLoginForRecord(uid, userData);
+    accountCreated = true;
+  }
+
+  await admin.auth().updateUser(uid, {password});
+
+  await userDocRef.set({
+    mustChangePassword: true,
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+  }, {merge: true});
+
+  await admin.firestore().collection("adminAuditLog").add({
+    action: "set_temporary_password",
+    targetUid: uid,
+    targetEmail: userData.email || null,
+    accountCreated,
+    actorUid: callerUid,
+    actorEmail: (request.auth.token && request.auth.token.email) || null,
+    at: admin.firestore.FieldValue.serverTimestamp(),
+  });
+
+  return {uid, accountCreated};
 });
 
 /** Restore an archived user. */
@@ -513,4 +604,5 @@ module.exports = {
   purgeArchivedUsers,
   verifyStaffPin,
   setUserPrivilege,
+  setTemporaryPassword,
 };

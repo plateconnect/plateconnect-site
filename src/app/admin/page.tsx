@@ -70,22 +70,29 @@ function normalizePlate(plate: string): string {
 }
 
 /**
- * Normalised plates a users/{uid} document owns, read the way syncPlateIndex
- * reads them (functions/plates.js userPlateEntries): `vehicles` when it has
- * entries, else the legacy licensePlateNumbers. Archived users and students
- * own none.
+ * Normalised plates a users/{uid} document lists, from BOTH `vehicles` and the
+ * legacy licensePlateNumbers. Archived users and students own none.
+ *
+ * Both, unlike syncPlateIndex (which prefers `vehicles`): the Users page used
+ * to write only licensePlateNumbers, so a plate corrected there before that
+ * was fixed lives only in the legacy field. This is just the dashboard's
+ * fallback for arrivals the gate could not match, so reading both lets those
+ * rows resolve before the record is re-saved.
  */
 function ownedPlates(d: DocumentData): string[] {
   if (d.status && d.status !== "active") return [];
   if (d.account_type === "student") return [];
   const vehicles: unknown[] = Array.isArray(d.vehicles) ? d.vehicles : [];
-  const raw = vehicles.length > 0
-    ? vehicles.map((v) => (v as { plate?: unknown } | null)?.plate)
-    : Array.isArray(d.licensePlateNumbers) ? d.licensePlateNumbers : [];
-  return raw
-    .filter((p): p is string => typeof p === "string" && p.length > 0)
-    .map(normalizePlate)
-    .filter(Boolean);
+  const legacy: unknown[] = Array.isArray(d.licensePlateNumbers) ? d.licensePlateNumbers : [];
+  const raw = [...vehicles.map((v) => (v as { plate?: unknown } | null)?.plate), ...legacy];
+  return [
+    ...new Set(
+      raw
+        .filter((p): p is string => typeof p === "string" && p.length > 0)
+        .map(normalizePlate)
+        .filter(Boolean),
+    ),
+  ];
 }
 
 /**

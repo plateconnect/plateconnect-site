@@ -67,6 +67,13 @@ A claim change only reaches a signed-in client when its ID token refreshes
 (~1 hour, or immediately on re-login). `AuthContext` forces one refresh when no
 `admin` claim is present, so a newly granted admin only needs to reload.
 
+On the website, the Users page edit modal grants access via `setUserPrivilege`
+and can set a temporary password via `setTemporaryPassword` (creates the login
+if missing, never stores the password, logs to `adminAuditLog`). That sets
+`users/{uid}.mustChangePassword`, and `PasswordChangeGate` makes the person pick
+their own password on next sign-in. This is the workaround while Firebase's
+emailed reset links are landing in spam / failing to open.
+
 `set_claims.py` is the break-glass path. Keep it working even after the
 in-website admin UI exists — if the site is the only way to grant admin and the
 last admin is lost, the lockout repeats.
