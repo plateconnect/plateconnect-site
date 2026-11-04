@@ -67,6 +67,13 @@ A claim change only reaches a signed-in client when its ID token refreshes
 (~1 hour, or immediately on re-login). `AuthContext` forces one refresh when no
 `admin` claim is present, so a newly granted admin only needs to reload.
 
+On the website, the Users page edit modal grants access via `setUserPrivilege`
+and can set a temporary password via `setTemporaryPassword` (creates the login
+if missing, never stores the password, logs to `adminAuditLog`). That sets
+`users/{uid}.mustChangePassword`, and `PasswordChangeGate` makes the person pick
+their own password on next sign-in. This is the workaround while Firebase's
+emailed reset links are landing in spam / failing to open.
+
 `set_claims.py` is the break-glass path. Keep it working even after the
 in-website admin UI exists — if the site is the only way to grant admin and the
 last admin is lost, the lockout repeats.
@@ -96,6 +103,12 @@ service account needs `roles/iam.serviceAccountTokenCreator` on itself to sign.
   but every read is `doc(db, 'users', <auth uid>)`. Such users appear in the
   admin list yet can never load their own profile. Use the `createUserAccount`
   callable, which creates the Auth account first and keys the doc by its UID.
+- **Plates live in `vehicles`.** `syncPlateIndex` reads the `vehicles` array
+  and only falls back to `licensePlateNumbers` when `vehicles` is empty. Any
+  write that changes plates must update both (the Users page's `plateFields()`
+  and `createUserAccount` do). Writing only `licensePlateNumbers` looks saved
+  in the UI but never reaches the `plates` index, so the gate keeps reporting
+  the new plate as unknown.
 - **Archive, never delete.** `archiveUser` / `restoreUser` callables. A hard
   delete is what caused the Aug 2026 data loss.
 - **`account_type` is not a permission.** `admin`, `staff`, `faculty` and

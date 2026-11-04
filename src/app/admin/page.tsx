@@ -61,6 +61,38 @@ interface Notice {
 interface PersonInfo {
   name: string;
   account_type: string;
+  wardIds?: string[];
+}
+
+/** Must match normalizePlate() in functions/plates.js. */
+function normalizePlate(plate: string): string {
+  return plate.toUpperCase().replace(/[^A-Z0-9]/g, "");
+}
+
+/**
+ * Normalised plates a users/{uid} document lists, from BOTH `vehicles` and the
+ * legacy licensePlateNumbers. Archived users and students own none.
+ *
+ * Both, unlike syncPlateIndex (which prefers `vehicles`): the Users page used
+ * to write only licensePlateNumbers, so a plate corrected there before that
+ * was fixed lives only in the legacy field. This is just the dashboard's
+ * fallback for arrivals the gate could not match, so reading both lets those
+ * rows resolve before the record is re-saved.
+ */
+function ownedPlates(d: DocumentData): string[] {
+  if (d.status && d.status !== "active") return [];
+  if (d.account_type === "student") return [];
+  const vehicles: unknown[] = Array.isArray(d.vehicles) ? d.vehicles : [];
+  const legacy: unknown[] = Array.isArray(d.licensePlateNumbers) ? d.licensePlateNumbers : [];
+  const raw = [...vehicles.map((v) => (v as { plate?: unknown } | null)?.plate), ...legacy];
+  return [
+    ...new Set(
+      raw
+        .filter((p): p is string => typeof p === "string" && p.length > 0)
+        .map(normalizePlate)
+        .filter(Boolean),
+    ),
+  ];
 }
 
 /**
@@ -78,10 +110,25 @@ interface PersonInfo {
  * A guardian arrival is about the students being collected, so ward names win;
  * faculty and staff have no wards, hence the fall back to their own name.
  */
-function personFor(n: Notice, users: Map<string, PersonInfo>): PersonInfo {
-  const live = n.owner_id ? users.get(n.owner_id) : undefined;
+function personFor(
+  n: Notice,
+  users: Map<string, PersonInfo>,
+  plateOwners: Map<string, string | null> = new Map(),
+): PersonInfo {
+  // No owner on the arrival means the pipeline found no match for the plate
+  // when it was detected — typically because the plate was added or corrected
+  // afterwards. Resolve it against who owns that plate *now*, so those rows
+  // stop reading "unknown" once user management is fixed. An exact match
+  // only (no O/0, I/1 folding), and never when two people list the plate.
+  const ownerId =
+    n.owner_id ||
+    (n.license_plate ? plateOwners.get(normalizePlate(n.license_plate)) : undefined) ||
+    undefined;
+  const live = ownerId ? users.get(ownerId) : undefined;
 
-  const liveWardNames = (n.ward_ids ?? [])
+  const wardIds =
+    n.ward_ids && n.ward_ids.length > 0 ? n.ward_ids : !n.owner_id ? live?.wardIds ?? [] : [];
+  const liveWardNames = wardIds
     .map((id) => users.get(id)?.name)
     .filter((v): v is string => Boolean(v));
 
@@ -304,6 +351,7 @@ async function exportRows(
   scope: ExportScope,
   format: ExportFormat,
   users: Map<string, PersonInfo>,
+  plateOwners: Map<string, string | null>,
 ) {
   const fmt = EXPORT_FORMATS[format];
   const headers = [
@@ -324,7 +372,7 @@ async function exportRows(
   const records: string[][] = rows.map((n) => {
     const arrival = n.arrival_time.toDate();
     const departure = n.departure_time?.toDate();
-    const person = personFor(n, users);
+    const person = personFor(n, users, plateOwners);
     return [
       person.account_type,
       person.name,
@@ -717,6 +765,8 @@ export default function AdminDashboardPage() {
   // card is right before any of the week is loaded.
   const [weekCount, setWeekCount] = useState<number | null>(null);
   const [userMap, setUserMap] = useState<Map<string, PersonInfo>>(new Map());
+  // normalised plate -> owning uid, or null when more than one person lists it.
+  const [plateOwners, setPlateOwners] = useState<Map<string, string | null>>(new Map());
 
   const [startDate, setStartDate] = useState("");
   const [endDate, setEndDate] = useState("");
@@ -777,14 +827,21 @@ export default function AdminDashboardPage() {
     if (!user || !db) return;
     const unsubscribe = onSnapshot(collection(db, "users"), (snapshot) => {
       const map = new Map<string, PersonInfo>();
+      const owners = new Map<string, string | null>();
       snapshot.forEach((docSnap) => {
         const d = docSnap.data();
         map.set(docSnap.id, {
           name: d.name || "",
           account_type: d.account_type || "",
+          wardIds: Array.isArray(d.wardIds) ? d.wardIds : [],
         });
+        for (const plate of ownedPlates(d)) {
+          const prev = owners.get(plate);
+          owners.set(plate, prev === undefined || prev === docSnap.id ? docSnap.id : null);
+        }
       });
       setUserMap(map);
+      setPlateOwners(owners);
     });
     return () => unsubscribe();
   }, [user]);
@@ -943,7 +1000,7 @@ export default function AdminDashboardPage() {
     }
     if (selectedPersonTypes.length > 0) {
       filtered = filtered.filter((n) =>
-        selectedPersonTypes.includes(personFor(n, userMap).account_type.toLowerCase())
+        selectedPersonTypes.includes(personFor(n, userMap, plateOwners).account_type.toLowerCase())
       );
     }
     if (selectedLocations.length > 0) {
@@ -965,9 +1022,9 @@ export default function AdminDashboardPage() {
     return filtered;
     // userMap matters: the person-type filter resolves through it, so the list
     // has to recompute once the user directory arrives.
-  }, [groupedNotices, searchQuery, startDate, endDate, startTime, endTime, selectedLocations, selectedPersonTypes, statusFilter, userMap]);
+  }, [groupedNotices, searchQuery, startDate, endDate, startTime, endTime, selectedLocations, selectedPersonTypes, statusFilter, userMap, plateOwners]);
 
-  const personOf = (n: Notice) => personFor(n, userMap);
+  const personOf = (n: Notice) => personFor(n, userMap, plateOwners);
 
   // Derived from the loaded rows, not the filtered ones — otherwise selecting
   // one location would drop every other option out of the list and you could
@@ -1047,7 +1104,7 @@ export default function AdminDashboardPage() {
     setExporting(true);
     setExportError(null);
     try {
-      await exportRows(await getExportRows(exportScope), exportScope, exportFormat, userMap);
+      await exportRows(await getExportRows(exportScope), exportScope, exportFormat, userMap, plateOwners);
       setExportModalOpen(false);
     } catch (err) {
       setExportError(err instanceof Error ? err.message : "Export failed.");

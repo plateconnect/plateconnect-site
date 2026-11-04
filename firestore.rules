@@ -48,7 +48,7 @@ service cloud.firestore {
         .hasOnly([
           'name', 'grade', 'vehicles', 'licensePlateNumbers',
           'carDescriptions', 'onboardingComplete', 'updatedAt',
-          'fcmToken', 'fcmTokenUpdatedAt'
+          'fcmToken', 'fcmTokenUpdatedAt', 'mustChangePassword'
         ]);
     }
 

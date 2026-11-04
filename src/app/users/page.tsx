@@ -26,7 +26,17 @@ interface AppUser {
   account_type: "guardian" | "student" | string;
   grade?: number;
   wardIds?: string[];
+  // The plates this person owns, read from whichever field actually holds
+  // them (see vehiclesOf). Kept as plain strings for the form and the list.
   licensePlateNumbers?: string[];
+  // Same plates with their descriptions — what syncPlateIndex reads. Kept so
+  // a save can write them back without dropping descriptions set elsewhere.
+  vehicles?: Vehicle[];
+  // Set when `vehicles` (what the gate uses) and licensePlateNumbers (what
+  // this page used to show and edit) disagree — records whose plate was
+  // edited here before both fields were written together. Saving the record
+  // brings the gate in line with the plates in the form.
+  platesOutOfSync?: { gate: string[]; page: string[] };
   fcmToken?: string;
   fcmTokenUpdatedAt?: Timestamp;
   onboardingComplete?: boolean;
@@ -37,6 +47,88 @@ interface AppUser {
   // switch, which lives on their login (see setUserPrivilege in
   // functions/user_admin.js) — kept here only so this page can show it.
   admin?: boolean;
+}
+
+interface Vehicle {
+  plate: string;
+  plateNormalized: string;
+  description: string | null;
+}
+
+/** Must match normalizePlate() in functions/plates.js. */
+function normalizePlate(plate: string): string {
+  return plate.toUpperCase().replace(/[^A-Z0-9]/g, "");
+}
+
+/**
+ * A user document's plates, read the same way syncPlateIndex
+ * (functions/plates.js userPlateEntries) reads them: the `vehicles` array
+ * when it has entries, else the legacy licensePlateNumbers/carDescriptions
+ * parallel arrays.
+ *
+ * This page used to read and write only licensePlateNumbers. Accounts made by
+ * createUserAccount or the mobile app carry `vehicles`, which the trigger
+ * prefers — so an edit here changed what this page showed but never reached
+ * the plate index, and the gate kept reporting the new plate as unknown.
+ */
+function vehiclesOf(data: Record<string, unknown>): Vehicle[] {
+  const vehicles = Array.isArray(data.vehicles) ? data.vehicles : [];
+  if (vehicles.length > 0) {
+    return vehicles
+      .filter((v): v is { plate: string; plateNormalized?: string; description?: string | null } =>
+        Boolean(v && typeof v === "object" && (v as { plate?: unknown }).plate))
+      .map((v) => ({
+        plate: String(v.plate),
+        plateNormalized: v.plateNormalized || normalizePlate(String(v.plate)),
+        description: v.description ?? null,
+      }));
+  }
+  const plates = Array.isArray(data.licensePlateNumbers) ? data.licensePlateNumbers : [];
+  const descriptions = Array.isArray(data.carDescriptions) ? data.carDescriptions : [];
+  return plates
+    .map((plate, i) => ({ plate, description: descriptions[i] }))
+    .filter(({ plate }) => Boolean(plate))
+    .map(({ plate, description }) => ({
+      plate: String(plate),
+      plateNormalized: normalizePlate(String(plate)),
+      description: description ? String(description) : null,
+    }));
+}
+
+/**
+ * The legacy licensePlateNumbers when they disagree with `vehicles`, else
+ * null. Only when both are non-empty: accounts made by createUserAccount used
+ * to have `vehicles` alone, which is not a conflict.
+ */
+function outOfSyncPlates(
+  data: Record<string, unknown>,
+  vehicles: Vehicle[],
+): { gate: string[]; page: string[] } | null {
+  if (!Array.isArray(data.vehicles) || data.vehicles.length === 0) return null;
+  const legacy = (Array.isArray(data.licensePlateNumbers) ? data.licensePlateNumbers : [])
+    .filter((p): p is string => typeof p === "string" && p.trim().length > 0);
+  if (legacy.length === 0) return null;
+  const key = (plates: string[]) => [...new Set(plates.map(normalizePlate))].sort().join(",");
+  const gate = vehicles.map((v) => v.plate);
+  return key(gate) === key(legacy) ? null : { gate, page: legacy };
+}
+
+/**
+ * Every plate field for a save, kept in step: `vehicles` (what the plate index
+ * reads) plus the legacy parallel arrays (what older app builds read).
+ * Descriptions already on file are carried over for plates that are kept.
+ */
+function plateFields(plates: string[], existing: Vehicle[] = []): Record<string, unknown> {
+  const byNorm = new Map(existing.map((v) => [v.plateNormalized, v]));
+  const vehicles: Vehicle[] = plates.map((plate) => {
+    const norm = normalizePlate(plate);
+    return { plate, plateNormalized: norm, description: byNorm.get(norm)?.description ?? null };
+  });
+  return {
+    vehicles,
+    licensePlateNumbers: vehicles.map((v) => v.plate),
+    carDescriptions: vehicles.map((v) => v.description ?? ""),
+  };
 }
 
 // ─── Account types ──────────────────────────────────────────────────────────
@@ -308,7 +400,7 @@ function partitionRows(
 // only when non-blank; never touch wardIds/onboardingComplete/fcmToken.
 function updateUserPayload(data: ImportRow, existing: AppUser): Record<string, unknown> {
   const payload: Record<string, unknown> = {
-    licensePlateNumbers: data.plates, // replace
+    ...plateFields(data.plates, existing.vehicles), // replace
   };
   if (data.name) payload.name = data.name;
   if (data.account_type) payload.account_type = data.account_type;
@@ -350,15 +442,64 @@ interface UserModalProps {
     uid: string,
     grantAdmin: boolean,
   ) => Promise<{ accountCreated: boolean }>;
+  onSetTemporaryPassword?: (
+    uid: string,
+    password: string,
+  ) => Promise<{ accountCreated: boolean }>;
+}
+
+/**
+ * A temporary password that is easy to read out over the phone: no 0/O, 1/l/I
+ * look-alikes, grouped in fours. 12 characters from a 55-symbol alphabet.
+ */
+function generateTempPassword(): string {
+  const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789";
+  const bytes = new Uint32Array(12);
+  crypto.getRandomValues(bytes);
+  const chars = Array.from(bytes, (b) => alphabet[b % alphabet.length]);
+  return [0, 4, 8].map((i) => chars.slice(i, i + 4).join("")).join("-");
 }
 
 // Result of the most recent grant, so the modal can tell the admin whether a
 // login was created and an email actually went out — not just "success".
 type EmailState = "idle" | "sending" | "sent" | "not-needed" | "error";
 
+function TempPasswordField({
+  value, onChange, onRegenerate,
+}: {
+  value: string;
+  onChange: (v: string) => void;
+  onRegenerate: () => void;
+}) {
+  return (
+    <div>
+      <div className="flex gap-2">
+        <input
+          type="text"
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+          autoComplete="off"
+          spellCheck={false}
+          className="flex-1 px-3 py-2 text-sm font-mono border border-gray-300 rounded-lg bg-white focus:outline-none focus:ring-2 focus:ring-blue-500"
+        />
+        <button
+          type="button"
+          onClick={onRegenerate}
+          className="px-2.5 py-2 text-xs font-medium text-gray-600 border border-gray-300 rounded-lg bg-white hover:bg-gray-50"
+        >
+          New
+        </button>
+      </div>
+      {value.trim().length < 8 && (
+        <p className="mt-1 text-xs text-red-600">At least 8 characters.</p>
+      )}
+    </div>
+  );
+}
+
 function UserModal({
   mode, initial, allStudents, onSave, onClose,
-  targetUser, currentUserId, onSetPrivilege,
+  targetUser, currentUserId, onSetPrivilege, onSetTemporaryPassword,
 }: UserModalProps) {
   const [form, setForm] = useState<UserFormData>(initial);
   const [saving, setSaving] = useState(false);
@@ -369,7 +510,16 @@ function UserModal({
   // would make it easy to change by accident, and hard to tell whether it
   // actually went through if the rest of the save failed.
   const [isAdmin, setIsAdmin] = useState(targetUser?.admin === true);
-  const [privilegeStep, setPrivilegeStep] = useState<"idle" | "confirm-grant" | "confirm-revoke">("idle");
+  const [privilegeStep, setPrivilegeStep] = useState<
+    "idle" | "confirm-grant" | "confirm-revoke" | "set-password"
+  >("idle");
+  // How a newly granted admin gets in. The emailed link has been landing in
+  // spam and failing to open, so a temporary password is the default for now.
+  const [signInMethod, setSignInMethod] = useState<"password" | "email">("password");
+  const [tempPassword, setTempPassword] = useState(generateTempPassword);
+  // The password just set, shown once so it can be passed on. Never stored.
+  const [issuedPassword, setIssuedPassword] = useState<string | null>(null);
+  const [copied, setCopied] = useState(false);
   const [confirmEmailInput, setConfirmEmailInput] = useState("");
   const [privilegeBusy, setPrivilegeBusy] = useState(false);
   const [privilegeError, setPrivilegeError] = useState("");
@@ -397,19 +547,66 @@ function UserModal({
     }
   };
 
+  const tempPasswordValid = tempPassword.trim().length >= 8;
+
+  const copyIssuedPassword = async () => {
+    if (!issuedPassword) return;
+    try {
+      await navigator.clipboard.writeText(issuedPassword);
+      setCopied(true);
+    } catch {
+      // Clipboard can be blocked; the password is on screen to copy by hand.
+    }
+  };
+
+  // Standalone "set a temporary password" — for someone who already has
+  // access but never managed to set a password through the email.
+  const runSetTemporaryPassword = async () => {
+    if (!targetUser || !onSetTemporaryPassword) return;
+    const password = tempPassword.trim();
+    setPrivilegeBusy(true);
+    setPrivilegeError("");
+    setIssuedPassword(null);
+    setCopied(false);
+    try {
+      await onSetTemporaryPassword(targetUser.id, password);
+      setIssuedPassword(password);
+      setPrivilegeStep("idle");
+      setTempPassword(generateTempPassword());
+    } catch (e: unknown) {
+      setPrivilegeError(e instanceof Error ? e.message : "Could not set the password.");
+    } finally {
+      setPrivilegeBusy(false);
+    }
+  };
+
   const runPrivilegeChange = async (grantAdmin: boolean) => {
     if (!targetUser || !onSetPrivilege) return;
     setPrivilegeBusy(true);
     setPrivilegeError("");
     setEmailState("idle");
     setEmailError("");
+    setIssuedPassword(null);
+    setCopied(false);
+    const usePassword = grantAdmin && signInMethod === "password";
+    const password = tempPassword.trim();
     try {
+      // Password first: it creates the login if there isn't one, and if the
+      // grant then fails they are left with a password but no access, which
+      // is harmless, rather than access they cannot use.
+      if (usePassword) {
+        if (!onSetTemporaryPassword) throw new Error("Not available");
+        await onSetTemporaryPassword(targetUser.id, password);
+      }
       const result = await onSetPrivilege(targetUser.id, grantAdmin);
       setIsAdmin(grantAdmin);
       setPrivilegeStep("idle");
       setConfirmEmailInput("");
 
-      if (grantAdmin) {
+      if (usePassword) {
+        setIssuedPassword(password);
+        setTempPassword(generateTempPassword());
+      } else if (grantAdmin) {
         if (result.accountCreated) {
           await sendSetupEmail();
         } else {
@@ -558,6 +755,16 @@ function UserModal({
                 placeholder="ABC-1234, XYZ-5678"
                 className="w-full px-3 py-2.5 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 font-mono"
               />
+              {targetUser?.platesOutOfSync && (
+                <p className="mt-1.5 text-xs text-amber-800 bg-amber-50 border border-amber-200 rounded px-2.5 py-1.5">
+                  The gate camera is still matching{" "}
+                  <span className="font-mono">{targetUser.platesOutOfSync.gate.join(", ") || "nothing"}</span>
+                  {" "}for this person, not{" "}
+                  <span className="font-mono">{targetUser.platesOutOfSync.page.join(", ")}</span>
+                  . Check the plates above are right and click Save Changes
+                  to update the gate.
+                </p>
+              )}
             </div>
           )}
 
@@ -639,8 +846,8 @@ function UserModal({
             <div className="border border-gray-200 rounded-lg px-4 py-3.5">
               <p className="text-sm font-medium text-gray-700">Portal access</p>
               <p className="text-xs text-gray-400 mt-0.5 mb-3">
-                Login access to this admin website. Emails a link to set a
-                password.
+                Login access to this admin website. Sign-in is set up with a
+                temporary password you give them, or an emailed link.
               </p>
 
               {isSelf ? (
@@ -685,6 +892,54 @@ function UserModal({
                     )}
                   </div>
 
+                  {privilegeStep === "idle" && targetEmail && onSetTemporaryPassword && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setPrivilegeStep("set-password");
+                        setPrivilegeError("");
+                        setIssuedPassword(null);
+                      }}
+                      className="mt-2 text-xs font-medium text-gray-600 hover:text-gray-800 underline"
+                    >
+                      Set a temporary password
+                    </button>
+                  )}
+
+                  {privilegeStep === "set-password" && (
+                    <div className="mt-3 bg-gray-50 border border-gray-200 rounded-lg p-3">
+                      <p className="text-xs text-gray-700 mb-2">
+                        Set a password for {targetUser.name || "this person"}{" "}
+                        to sign in with ({targetEmail}). It replaces any
+                        password they already have, and they&apos;ll be asked
+                        to choose their own the first time they sign in. This
+                        does not change their admin access.
+                      </p>
+                      <TempPasswordField
+                        value={tempPassword}
+                        onChange={setTempPassword}
+                        onRegenerate={() => setTempPassword(generateTempPassword())}
+                      />
+                      <div className="flex justify-end gap-2 mt-2">
+                        <button
+                          type="button"
+                          onClick={() => { setPrivilegeStep("idle"); setPrivilegeError(""); }}
+                          className="px-3 py-1.5 text-xs font-medium text-gray-600 hover:text-gray-800"
+                        >
+                          Cancel
+                        </button>
+                        <button
+                          type="button"
+                          disabled={privilegeBusy || !tempPasswordValid}
+                          onClick={runSetTemporaryPassword}
+                          className="px-3 py-1.5 text-xs font-medium bg-gray-800 text-white rounded-lg hover:bg-gray-900 disabled:opacity-40 disabled:cursor-not-allowed transition"
+                        >
+                          {privilegeBusy ? "Setting…" : "Set password"}
+                        </button>
+                      </div>
+                    </div>
+                  )}
+
                   {privilegeStep === "confirm-grant" && (
                     <div className="mt-3 bg-amber-50 border border-amber-200 rounded-lg p-3">
                       <p className="text-xs text-amber-800 mb-2">
@@ -692,10 +947,49 @@ function UserModal({
                         access to this admin website and the power to grant
                         or remove access for anyone else.{" "}
                         {targetUser.email
-                          ? "They will receive an email with a link to set a password if they don't already have a login."
-                          : "This record has no email on file, so a login can't be created for them — add one first."}
-                        {" "}Type their email to confirm.
+                          ? null
+                          : "This record has no email on file, so a login can't be created for them — add one first. "}
+                        Type their email to confirm.
                       </p>
+                      {targetUser.email && onSetTemporaryPassword && (
+                        <div className="mb-2 space-y-1.5">
+                          <label className="flex items-start gap-2 text-xs text-amber-900">
+                            <input
+                              type="radio"
+                              name="sign-in-method"
+                              checked={signInMethod === "password"}
+                              onChange={() => setSignInMethod("password")}
+                              className="mt-0.5"
+                            />
+                            <span>
+                              Set a temporary password now and give it to
+                              them yourself
+                            </span>
+                          </label>
+                          {signInMethod === "password" && (
+                            <div className="pl-5">
+                              <TempPasswordField
+                                value={tempPassword}
+                                onChange={setTempPassword}
+                                onRegenerate={() => setTempPassword(generateTempPassword())}
+                              />
+                            </div>
+                          )}
+                          <label className="flex items-start gap-2 text-xs text-amber-900">
+                            <input
+                              type="radio"
+                              name="sign-in-method"
+                              checked={signInMethod === "email"}
+                              onChange={() => setSignInMethod("email")}
+                              className="mt-0.5"
+                            />
+                            <span>
+                              Email them a link to set a password (only if
+                              they don&apos;t already have a login)
+                            </span>
+                          </label>
+                        </div>
+                      )}
                       <input
                         type="text"
                         value={confirmEmailInput}
@@ -716,7 +1010,8 @@ function UserModal({
                           disabled={
                             privilegeBusy ||
                             !targetEmail ||
-                            confirmEmailInput.trim().toLowerCase() !== targetEmail
+                            confirmEmailInput.trim().toLowerCase() !== targetEmail ||
+                            (signInMethod === "password" && !tempPasswordValid)
                           }
                           onClick={() => runPrivilegeChange(true)}
                           className="px-3 py-1.5 text-xs font-medium bg-amber-600 text-white rounded-lg hover:bg-amber-700 disabled:opacity-40 disabled:cursor-not-allowed transition"
@@ -760,6 +1055,36 @@ function UserModal({
                     </p>
                   )}
 
+                  {issuedPassword && (
+                    <div className="mt-2 text-xs text-green-800 bg-green-50 border border-green-200 px-2.5 py-2 rounded space-y-1.5">
+                      <p>
+                        Password set. {targetUser.name || "They"} can now sign
+                        in with:
+                      </p>
+                      <p>
+                        Email: <span className="font-mono">{targetEmail}</span>
+                      </p>
+                      <p className="flex items-center gap-2">
+                        Password:{" "}
+                        <span className="font-mono text-sm bg-white border border-green-200 rounded px-1.5 py-0.5 select-all">
+                          {issuedPassword}
+                        </span>
+                        <button
+                          type="button"
+                          onClick={copyIssuedPassword}
+                          className="font-medium text-green-700 hover:text-green-900 underline"
+                        >
+                          {copied ? "Copied" : "Copy"}
+                        </button>
+                      </p>
+                      <p className="text-green-700">
+                        Pass it on in person or by phone rather than email.
+                        It won&apos;t be shown again. They&apos;ll be asked to
+                        choose their own password after signing in.
+                      </p>
+                    </div>
+                  )}
+
                   {emailState === "sending" && (
                     <p className="mt-2 text-xs text-gray-500">
                       Sending the setup email…
@@ -774,7 +1099,17 @@ function UserModal({
                   {emailState === "not-needed" && (
                     <p className="mt-2 text-xs text-gray-500 bg-gray-50 px-2.5 py-1.5 rounded">
                       Access granted. They already had a login for this site,
-                      so no new email was needed.
+                      so no email was sent. If they never set a password
+                      (accounts added here or by CSV import start without
+                      one),{" "}
+                      <button
+                        type="button"
+                        onClick={sendSetupEmail}
+                        className="font-medium text-blue-700 hover:text-blue-800 underline"
+                      >
+                        send them a password setup email
+                      </button>
+                      .
                     </p>
                   )}
                   {emailState === "error" && (
@@ -1375,6 +1710,8 @@ function UserManagementContent() {
       const usersData: AppUser[] = [];
       snapshot.forEach((docSnap) => {
         const data = docSnap.data();
+        const vehicles = vehiclesOf(data);
+        const outOfSync = outOfSyncPlates(data, vehicles);
         usersData.push({
           id: docSnap.id,
           name: data.name || "Unknown",
@@ -1382,7 +1719,11 @@ function UserManagementContent() {
           account_type: data.account_type || "unknown",
           grade: data.grade,
           wardIds: data.wardIds || [],
-          licensePlateNumbers: data.licensePlateNumbers || [],
+          // When the two disagree, show what this page showed before (the
+          // plate an admin last typed here); the modal explains the conflict.
+          licensePlateNumbers: outOfSync ? outOfSync.page : vehicles.map((v) => v.plate),
+          vehicles,
+          platesOutOfSync: outOfSync ?? undefined,
           fcmToken: data.fcmToken,
           fcmTokenUpdatedAt: data.fcmTokenUpdatedAt,
           onboardingComplete: data.onboardingComplete,
@@ -1522,7 +1863,7 @@ function UserManagementContent() {
 
   // ── Firebase write helpers ────────────────────────────────────────────────
 
-  const buildPayload = (form: UserFormData) => {
+  const buildPayload = (form: UserFormData, existing?: AppUser) => {
     const base: Record<string, unknown> = {
       name: form.name.trim(),
       email: form.email.trim() || null,
@@ -1533,7 +1874,10 @@ function UserManagementContent() {
       base.grade = form.grade ? parseInt(form.grade, 10) : null;
     } else {
       // Any non-student role can own vehicles.
-      base.licensePlateNumbers = splitCsv(form.licensePlateNumbers);
+      Object.assign(
+        base,
+        plateFields(splitCsv(form.licensePlateNumbers), existing?.vehicles),
+      );
       // Only guardians pick students up, so only they carry wardIds. Writing
       // an empty array onto faculty rows would make the plate-index trigger
       // and the security rules reason about links that do not exist.
@@ -1546,7 +1890,7 @@ function UserManagementContent() {
 
   const handleSaveEdit = async (form: UserFormData) => {
     if (!editTarget || !db) throw new Error("No target user");
-    await updateDoc(doc(db, "users", editTarget.id), buildPayload(form));
+    await updateDoc(doc(db, "users", editTarget.id), buildPayload(form, editTarget));
   };
 
   // Creating a user goes through a callable, never addDoc().
@@ -1574,12 +1918,10 @@ function UserManagementContent() {
       wardIds: form.account_type === "guardian"
         ? splitCsv(form.wardIds)
         : undefined,
-      vehicles: form.account_type === "guardian"
-        ? splitCsv(form.licensePlateNumbers).map((plate) => ({
-            plate,
-            plateNormalized: plate.toUpperCase().replace(/[^A-Z0-9]/g, ""),
-            description: null,
-          }))
+      // Any non-student role can own vehicles — this used to send them for
+      // guardians only, so faculty/staff added here lost their plates.
+      vehicles: form.account_type !== "student"
+        ? plateFields(splitCsv(form.licensePlateNumbers)).vehicles
         : undefined,
     });
 
@@ -1619,6 +1961,17 @@ function UserManagementContent() {
     return result.data;
   };
 
+  // Temporary password, set server-side by an admin-only callable. The
+  // password goes straight to Firebase Auth and is never written to Firestore.
+  const handleSetTemporaryPassword = async (uid: string, password: string) => {
+    if (!functions) throw new Error("Firebase not initialized");
+    const result = await httpsCallable<
+      { uid: string; password: string },
+      { uid: string; accountCreated: boolean }
+    >(functions, "setTemporaryPassword")({ uid, password });
+    return result.data;
+  };
+
   const handleImport = async (rows: PartitionedRow[]): Promise<ImportResult> => {
     if (!db || !functions) throw new Error("Firebase not initialized");
     const database = db;
@@ -1642,11 +1995,7 @@ function UserManagementContent() {
           grade: row.data.account_type === "student" && row.data.grade
             ? parseInt(row.data.grade, 10)
             : undefined,
-          vehicles: row.data.plates.map((plate) => ({
-            plate,
-            plateNormalized: plate.toUpperCase().replace(/[^A-Z0-9]/g, ""),
-            description: null,
-          })),
+          vehicles: plateFields(row.data.plates).vehicles,
         });
         created++;
       } catch (err) {
@@ -1977,6 +2326,14 @@ function UserManagementContent() {
                         <td className="px-6 py-4">
                           <div className="flex items-center gap-2">
                             <span className="font-medium text-gray-900">{u.name}</span>
+                            {u.platesOutOfSync && (
+                              <span
+                                className="px-2 py-0.5 rounded-full text-[11px] font-semibold bg-amber-100 text-amber-800"
+                                title="The gate is matching an older plate. Open and save this record to fix it."
+                              >
+                                Plate not synced
+                              </span>
+                            )}
                             {isGuardian && (
                               <button
                                 onClick={() => setExpandedGuardian(isExpanded ? null : u.id)}
@@ -2162,6 +2519,7 @@ function UserManagementContent() {
           targetUser={editTarget}
           currentUserId={user?.uid}
           onSetPrivilege={handleSetPrivilege}
+          onSetTemporaryPassword={handleSetTemporaryPassword}
         />
       )}
 
