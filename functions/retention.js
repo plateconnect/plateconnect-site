@@ -18,6 +18,7 @@
  */
 const {onSchedule} = require("firebase-functions/v2/scheduler");
 const admin = require("firebase-admin");
+const {FieldValue, Timestamp} = require("firebase-admin/firestore");
 
 const DEFAULT_DAYS = 60;
 const MIN_DAYS = 7;
@@ -50,7 +51,7 @@ const pruneOldArrivals = onSchedule(
         return;
       }
 
-      const cutoff = admin.firestore.Timestamp.fromMillis(
+      const cutoff = Timestamp.fromMillis(
           startedAt - days * 24 * 60 * 60 * 1000,
       );
 
@@ -76,7 +77,7 @@ const pruneOldArrivals = onSchedule(
       }
 
       await db.doc("settings/arrivalRetentionLastRun").set({
-        at: admin.firestore.FieldValue.serverTimestamp(),
+        at: FieldValue.serverTimestamp(),
         days,
         cutoff,
         deleted,

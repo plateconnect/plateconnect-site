@@ -15,6 +15,7 @@
 const {onCall, HttpsError} = require("firebase-functions/v2/https");
 const {onSchedule} = require("firebase-functions/v2/scheduler");
 const admin = require("firebase-admin");
+const {FieldValue, Timestamp} = require("firebase-admin/firestore");
 
 const PURGE_AFTER_DAYS = 90;
 
@@ -115,11 +116,11 @@ const createUserAccount = onCall(async (request) => {
       account_type: role,
       status: "active",
       onboardingComplete: false,
-      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: FieldValue.serverTimestamp(),
     };
     if (Array.isArray(vehicles)) Object.assign(body, plateFields(vehicles));
     if (dup.empty) {
-      body.createdAt = admin.firestore.FieldValue.serverTimestamp();
+      body.createdAt = FieldValue.serverTimestamp();
     }
     await ref.set(body, {merge: true});
     return {uid: ref.id, created: dup.empty, loginCreated: false,
@@ -148,7 +149,7 @@ const createUserAccount = onCall(async (request) => {
     account_type: role,
     status: "active",
     onboardingComplete: false,
-    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    updatedAt: FieldValue.serverTimestamp(),
   };
   if (role === "student" && Number.isInteger(grade)) {
     profile.grade = grade;
@@ -159,7 +160,7 @@ const createUserAccount = onCall(async (request) => {
   const ref = admin.firestore().collection("users").doc(user.uid);
   const existing = await ref.get();
   if (!existing.exists) {
-    profile.createdAt = admin.firestore.FieldValue.serverTimestamp();
+    profile.createdAt = FieldValue.serverTimestamp();
   }
   await ref.set(profile, {merge: true});
 
@@ -199,9 +200,9 @@ const archiveUser = onCall(async (request) => {
 
   await ref.set({
     status: "archived",
-    archivedAt: admin.firestore.FieldValue.serverTimestamp(),
+    archivedAt: FieldValue.serverTimestamp(),
     archivedBy: callerUid,
-    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    updatedAt: FieldValue.serverTimestamp(),
   }, {merge: true});
 
   // Block sign-in without destroying the account.
@@ -408,7 +409,7 @@ const setUserPrivilege = onCall(async (request) => {
   // Not the gate; security rules and AuthContext read the claim, not this.
   await userDocRef.set({
     admin: grantAdmin,
-    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    updatedAt: FieldValue.serverTimestamp(),
   }, {merge: true});
 
   if (!grantAdmin) {
@@ -422,7 +423,7 @@ const setUserPrivilege = onCall(async (request) => {
     accountCreated,
     actorUid: callerUid,
     actorEmail: (request.auth.token && request.auth.token.email) || null,
-    at: admin.firestore.FieldValue.serverTimestamp(),
+    at: FieldValue.serverTimestamp(),
   });
 
   // The setup email (when the admin chose it over a temporary password) is
@@ -489,7 +490,7 @@ const setTemporaryPassword = onCall(async (request) => {
 
   await userDocRef.set({
     mustChangePassword: true,
-    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    updatedAt: FieldValue.serverTimestamp(),
   }, {merge: true});
 
   await admin.firestore().collection("adminAuditLog").add({
@@ -499,7 +500,7 @@ const setTemporaryPassword = onCall(async (request) => {
     accountCreated,
     actorUid: callerUid,
     actorEmail: (request.auth.token && request.auth.token.email) || null,
-    at: admin.firestore.FieldValue.serverTimestamp(),
+    at: FieldValue.serverTimestamp(),
   });
 
   return {uid, accountCreated};
@@ -513,9 +514,9 @@ const restoreUser = onCall(async (request) => {
 
   await admin.firestore().collection("users").doc(uid).set({
     status: "active",
-    archivedAt: admin.firestore.FieldValue.delete(),
-    archivedBy: admin.firestore.FieldValue.delete(),
-    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    archivedAt: FieldValue.delete(),
+    archivedBy: FieldValue.delete(),
+    updatedAt: FieldValue.serverTimestamp(),
   }, {merge: true});
 
   try {
@@ -532,7 +533,7 @@ const restoreUser = onCall(async (request) => {
  * Runs weekly. This is the ONLY path that hard-deletes a user.
  */
 const purgeArchivedUsers = onSchedule("every sunday 04:17", async () => {
-  const cutoff = admin.firestore.Timestamp.fromMillis(
+  const cutoff = Timestamp.fromMillis(
       Date.now() - PURGE_AFTER_DAYS * 24 * 60 * 60 * 1000,
   );
 

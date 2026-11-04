@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useMemo, Suspense } from "react";
+import { Fragment, useState, useEffect, useMemo, useRef, Suspense } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { useAuth } from "@/context/AuthContext";
 import { auth, db, functions } from "@/lib/firebase";
@@ -527,6 +527,23 @@ function UserModal({
   const [emailError, setEmailError] = useState("");
 
   const isSelf = targetUser != null && targetUser.id === currentUserId;
+
+  // The access section sits at the bottom of a scrolling form, so an opened
+  // step (and its result) can land below the fold, right above Save Changes.
+  const privilegeRef = useRef<HTMLDivElement>(null);
+  // Why Save Changes refused to close, shown inside the access section.
+  // Cleared as soon as that step is confirmed or cancelled.
+  const [saveBlocked, setSaveBlocked] = useState<string | null>(null);
+  useEffect(() => setSaveBlocked(null), [privilegeStep]);
+  const saveBlockedRef = useRef<HTMLParagraphElement>(null);
+  useEffect(() => {
+    if (saveBlocked) saveBlockedRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  }, [saveBlocked]);
+  useEffect(() => {
+    if (privilegeStep !== "idle" || issuedPassword) {
+      privilegeRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    }
+  }, [privilegeStep, issuedPassword]);
   const targetEmail = (targetUser?.email || "").trim().toLowerCase();
 
   // Fires Firebase's own built-in "set your password" email. There's no
@@ -625,6 +642,19 @@ function UserModal({
 
   const handleSave = async () => {
     if (!form.name.trim()) { setError("Name is required."); return; }
+    // Save Changes only saves the fields above; it never applies portal
+    // access. Closing here would silently drop a grant that was set up but
+    // not confirmed, which looks exactly like "it didn't save".
+    if (privilegeStep !== "idle") {
+      setSaveBlocked(
+        privilegeStep === "set-password"
+          ? "The temporary password isn't set yet. Click \"Set password\" in Portal access, or Cancel it, before saving."
+          : privilegeStep === "confirm-grant"
+            ? "Admin access hasn't been granted yet. Click \"Confirm grant\" in Portal access, or Cancel it, before saving."
+            : "Finish or cancel the Portal access change before saving.",
+      );
+      return;
+    }
     setSaving(true);
     setError("");
     try {
@@ -843,7 +873,7 @@ function UserModal({
           {/* Portal access — edit mode only, and only once the target user
               is known, so there's an actual record to point the button at. */}
           {mode === "edit" && targetUser && (
-            <div className="border border-gray-200 rounded-lg px-4 py-3.5">
+            <div ref={privilegeRef} className="border border-gray-200 rounded-lg px-4 py-3.5">
               <p className="text-sm font-medium text-gray-700">Portal access</p>
               <p className="text-xs text-gray-400 mt-0.5 mb-3">
                 Login access to this admin website. Sign-in is set up with a
@@ -945,14 +975,16 @@ function UserModal({
                       <p className="text-xs text-amber-800 mb-2">
                         This gives {targetUser.name || "this person"} full
                         access to this admin website and the power to grant
-                        or remove access for anyone else.{" "}
+                        or remove access for anyone else.
                         {targetUser.email
                           ? null
-                          : "This record has no email on file, so a login can't be created for them — add one first. "}
-                        Type their email to confirm.
+                          : " This record has no email on file, so a login can't be created for them — add one first."}
                       </p>
                       {targetUser.email && onSetTemporaryPassword && (
-                        <div className="mb-2 space-y-1.5">
+                        <div className="mb-3 space-y-1.5">
+                          <p className="text-xs font-semibold text-amber-900">
+                            How will they sign in?
+                          </p>
                           <label className="flex items-start gap-2 text-xs text-amber-900">
                             <input
                               type="radio"
@@ -968,6 +1000,9 @@ function UserModal({
                           </label>
                           {signInMethod === "password" && (
                             <div className="pl-5">
+                              <p className="text-xs text-amber-800 mb-1">
+                                Temporary password (give this to them):
+                              </p>
                               <TempPasswordField
                                 value={tempPassword}
                                 onChange={setTempPassword}
@@ -990,8 +1025,16 @@ function UserModal({
                           </label>
                         </div>
                       )}
+                      <label
+                        htmlFor="confirm-grant-email"
+                        className="block text-xs font-semibold text-amber-900 mb-1"
+                      >
+                        Type their email to confirm
+                      </label>
                       <input
-                        type="text"
+                        id="confirm-grant-email"
+                        type="email"
+                        autoComplete="off"
                         value={confirmEmailInput}
                         onChange={(e) => setConfirmEmailInput(e.target.value)}
                         placeholder={targetUser.email || "their email"}
@@ -1019,6 +1062,13 @@ function UserModal({
                           {privilegeBusy ? "Granting…" : "Confirm grant"}
                         </button>
                       </div>
+                      {targetEmail &&
+                        confirmEmailInput.trim() !== "" &&
+                        confirmEmailInput.trim().toLowerCase() !== targetEmail && (
+                          <p className="mt-1.5 text-xs text-amber-800">
+                            That doesn&apos;t match {targetEmail} yet.
+                          </p>
+                        )}
                     </div>
                   )}
 
@@ -1052,6 +1102,12 @@ function UserModal({
                   {privilegeError && (
                     <p className="mt-2 text-xs text-red-600 bg-red-50 px-2.5 py-1.5 rounded">
                       {privilegeError}
+                    </p>
+                  )}
+
+                  {saveBlocked && (
+                    <p ref={saveBlockedRef} className="mt-2 text-xs font-medium text-red-700 bg-red-50 border border-red-200 px-2.5 py-1.5 rounded">
+                      {saveBlocked}
                     </p>
                   )}
 
@@ -2315,7 +2371,7 @@ function UserManagementContent() {
                     : [];
 
                   return (
-                    <>
+                    <Fragment key={u.id}>
                       <tr
                         key={u.id}
                         className={`border-b border-gray-100 hover:bg-gray-50 transition-colors ${
@@ -2454,7 +2510,7 @@ function UserManagementContent() {
                           </td>
                         </tr>
                       )}
-                    </>
+                    </Fragment>
                   );
                 })}
               </tbody>

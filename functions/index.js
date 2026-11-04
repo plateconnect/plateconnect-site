@@ -1,5 +1,6 @@
 const {onCall, onRequest, HttpsError} = require("firebase-functions/v2/https");
 const admin = require("firebase-admin");
+const {Timestamp} = require("firebase-admin/firestore");
 const {
   oneSignalApiKey,
   sendOneSignalPush,
@@ -192,7 +193,7 @@ exports.sendPickupNotificationHttp = onRequest(
           const noticeRef = noticesRef.doc();
           noticeId = noticeRef.id;
           batch.set(noticeRef, {
-            arrival_time: admin.firestore.Timestamp.now(),
+            arrival_time: Timestamp.now(),
             ward_id: finalStudentId,
             ward_name: studentData.name || "Student",
             parent_name: resolvedParentName,

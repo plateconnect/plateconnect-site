@@ -15,6 +15,7 @@
 const {onCall, HttpsError} = require("firebase-functions/v2/https");
 const {onDocumentWritten} = require("firebase-functions/v2/firestore");
 const admin = require("firebase-admin");
+const {FieldValue} = require("firebase-admin/firestore");
 
 /**
  * Ward ids on a user document, ignoring archived users.
@@ -47,14 +48,14 @@ const syncGuardianLinks = onDocumentWritten("users/{uid}", async (event) => {
 
   for (const wardId of added) {
     batch.set(db.collection("users").doc(wardId), {
-      guardianIds: admin.firestore.FieldValue.arrayUnion(uid),
-      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      guardianIds: FieldValue.arrayUnion(uid),
+      updatedAt: FieldValue.serverTimestamp(),
     }, {merge: true});
   }
   for (const wardId of removed) {
     batch.set(db.collection("users").doc(wardId), {
-      guardianIds: admin.firestore.FieldValue.arrayRemove(uid),
-      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      guardianIds: FieldValue.arrayRemove(uid),
+      updatedAt: FieldValue.serverTimestamp(),
     }, {merge: true});
   }
 
@@ -127,8 +128,8 @@ const linkWardByEmail = onCall(async (request) => {
   }
 
   await db.collection("users").doc(guardianId).set({
-    wardIds: admin.firestore.FieldValue.arrayUnion(student.id),
-    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    wardIds: FieldValue.arrayUnion(student.id),
+    updatedAt: FieldValue.serverTimestamp(),
   }, {merge: true});
   // guardianIds is mirrored by syncGuardianLinks.
 
@@ -148,8 +149,8 @@ const unlinkWard = onCall(async (request) => {
   if (!wardId) throw new HttpsError("invalid-argument", "wardId is required");
 
   await admin.firestore().collection("users").doc(request.auth.uid).set({
-    wardIds: admin.firestore.FieldValue.arrayRemove(wardId),
-    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    wardIds: FieldValue.arrayRemove(wardId),
+    updatedAt: FieldValue.serverTimestamp(),
   }, {merge: true});
 
   return {wardId, unlinked: true};

@@ -11,6 +11,7 @@
  */
 const {onDocumentWritten} = require("firebase-functions/v2/firestore");
 const admin = require("firebase-admin");
+const {FieldValue} = require("firebase-admin/firestore");
 
 /**
  * Canonical plate form used as the `plates` document ID.
@@ -101,7 +102,7 @@ const syncPlateIndex = onDocumentWritten("users/{uid}", async (event) => {
       guardianId: uid,
       description: entry.description,
       active: true,
-      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: FieldValue.serverTimestamp(),
     }, {merge: true});
     ops++;
   }
